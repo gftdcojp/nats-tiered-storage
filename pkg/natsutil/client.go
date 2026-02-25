@@ -1,3 +1,5 @@
+// Package natsutil provides helpers for establishing NATS connections
+// with TLS, credentials, NKey, and reconnection handling.
 package natsutil
 
 import (

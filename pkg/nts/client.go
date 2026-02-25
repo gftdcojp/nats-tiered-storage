@@ -1,14 +1,3 @@
-// Package nts provides a transparent client for NATS JetStream with automatic
-// fallback to cold (tiered) storage. When data has been moved from JetStream
-// to the nats-tiered-storage sidecar, this client seamlessly retrieves it.
-//
-// Usage:
-//
-//	client, _ := nts.New(nts.Config{NC: nc, JS: js})
-//	kv, _ := client.KeyValue(ctx, "config")
-//	entry, _ := kv.Get(ctx, "app.database_url")   // transparent cold fallback
-//	obs, _ := client.ObjectStore(ctx, "files")
-//	reader, _ := obs.Get(ctx, "report.pdf")        // chunk reassembly from cold
 package nts
 
 import (

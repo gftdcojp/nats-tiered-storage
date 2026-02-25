@@ -1,3 +1,5 @@
+// Package s3util provides a factory for creating AWS S3-compatible clients
+// for use with blob tier storage (AWS S3, MinIO, Cloudflare R2).
 package s3util
 
 import (

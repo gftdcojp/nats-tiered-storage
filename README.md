@@ -159,6 +159,10 @@ nts-ctl obj get files report.pdf > report.pdf
 
 For Go applications, the `pkg/nts` library wraps `jetstream.KeyValue` and `jetstream.ObjectStore` with automatic fallback to cold storage:
 
+```bash
+go get github.com/gftdcojp/nats-tiered-storage/pkg/nts
+```
+
 ```go
 import "github.com/gftdcojp/nats-tiered-storage/pkg/nts"
 

@@ -9,6 +9,7 @@ import (
 	"github.com/gftdcojp/nats-tiered-storage/internal/block"
 	"github.com/gftdcojp/nats-tiered-storage/internal/config"
 	"github.com/gftdcojp/nats-tiered-storage/internal/meta"
+	"github.com/gftdcojp/nats-tiered-storage/internal/metrics"
 	"go.uber.org/zap"
 )
 
@@ -105,6 +106,10 @@ func (c *Controller) Ingest(ctx context.Context, blk *block.Block) error {
 		return fmt.Errorf("recording block metadata: %w", err)
 	}
 
+	// Update tier metrics
+	metrics.TierBlockCount.WithLabelValues(c.stream, initialTier.String()).Inc()
+	metrics.TierBytes.WithLabelValues(c.stream, initialTier.String()).Add(float64(blk.SizeBytes))
+
 	c.logger.Info("block ingested",
 		zap.Uint64("block_id", blk.ID),
 		zap.Uint64("first_seq", blk.FirstSeq),
@@ -159,6 +164,11 @@ func (c *Controller) Demote(ctx context.Context, blockID uint64, from, to Tier) 
 			zap.Error(err), zap.Uint64("block_id", blockID), zap.String("from", from.String()))
 	}
 
+	// Update metrics
+	metrics.DemotionOps.WithLabelValues(c.stream, from.String(), to.String()).Inc()
+	metrics.TierBlockCount.WithLabelValues(c.stream, from.String()).Dec()
+	metrics.TierBlockCount.WithLabelValues(c.stream, to.String()).Inc()
+
 	c.logger.Info("block demoted",
 		zap.Uint64("block_id", blockID),
 		zap.String("from", from.String()),
@@ -190,6 +200,8 @@ func (c *Controller) Promote(ctx context.Context, blockID uint64, from, to Tier)
 		return err
 	}
 
+	metrics.PromotionOps.WithLabelValues(c.stream, from.String(), to.String()).Inc()
+
 	c.logger.Debug("block promoted (cached)",
 		zap.Uint64("block_id", blockID),
 		zap.String("from", from.String()),
@@ -207,26 +219,31 @@ func (c *Controller) Retrieve(ctx context.Context, seq uint64) (*StoredMessage, 
 	}
 
 	ref := entry.Ref()
+	tierName := entry.CurrentTier.String()
+	start := time.Now()
 
+	var msg *StoredMessage
 	switch entry.CurrentTier {
 	case TierMemory:
-		return c.memory.GetMessage(ctx, ref, seq)
+		msg, err = c.memory.GetMessage(ctx, ref, seq)
 	case TierFile:
-		msg, err := c.file.GetMessage(ctx, ref, seq)
+		msg, err = c.file.GetMessage(ctx, ref, seq)
 		if err == nil && c.memory != nil && c.policy.cfg.Memory.Enabled {
-			// Async promote to memory
 			go c.Promote(context.Background(), entry.BlockID, TierFile, TierMemory)
 		}
-		return msg, err
 	case TierBlob:
-		msg, err := c.blob.GetMessage(ctx, ref, seq)
+		msg, err = c.blob.GetMessage(ctx, ref, seq)
 		if err == nil && c.file != nil && c.policy.cfg.File.Enabled {
-			// Async promote to file tier
 			go c.Promote(context.Background(), entry.BlockID, TierBlob, TierFile)
 		}
-		return msg, err
+	default:
+		return nil, fmt.Errorf("message not found: seq=%d", seq)
 	}
-	return nil, fmt.Errorf("message not found: seq=%d", seq)
+
+	metrics.ReadRequests.WithLabelValues(c.stream, tierName).Inc()
+	metrics.ReadLatency.WithLabelValues(c.stream, tierName).Observe(time.Since(start).Seconds())
+
+	return msg, err
 }
 
 // RetrieveRange returns messages in a sequence range.

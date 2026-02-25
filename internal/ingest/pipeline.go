@@ -11,6 +11,7 @@ import (
 	"github.com/gftdcojp/nats-tiered-storage/internal/block"
 	"github.com/gftdcojp/nats-tiered-storage/internal/config"
 	"github.com/gftdcojp/nats-tiered-storage/internal/meta"
+	"github.com/gftdcojp/nats-tiered-storage/internal/metrics"
 	"github.com/gftdcojp/nats-tiered-storage/internal/tier"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
@@ -179,6 +180,7 @@ func (p *Pipeline) FlushAndClose(ctx context.Context) error {
 }
 
 func (p *Pipeline) sealAndIngest(ctx context.Context) error {
+	sealStart := time.Now()
 	blk, err := p.builder.Seal()
 	if err != nil {
 		return fmt.Errorf("sealing block: %w", err)
@@ -187,9 +189,15 @@ func (p *Pipeline) sealAndIngest(ctx context.Context) error {
 		return nil
 	}
 
+	metrics.BlockSealDuration.WithLabelValues(p.streamCfg.Name).Observe(time.Since(sealStart).Seconds())
+
 	if err := p.ctrl.Ingest(ctx, blk); err != nil {
 		return fmt.Errorf("ingesting block: %w", err)
 	}
+
+	// Update metrics
+	metrics.BlocksSealed.WithLabelValues(p.streamCfg.Name).Inc()
+	metrics.MessagesIngested.WithLabelValues(p.streamCfg.Name).Add(float64(blk.MsgCount))
 
 	// ACK after successful ingest
 	for _, msg := range p.pendingAcks {

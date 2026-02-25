@@ -311,6 +311,165 @@ Request → Metadata Lookup → Tier routing
   → Blob hit    → S3 Range Request → return + async promote to file
 ```
 
+## Using with an Existing JetStream Environment
+
+`nats-tiered-storage` is non-invasive — it connects as a standard NATS client and requires **no changes** to your existing `nats-server` or streams.
+
+### Step 1: Identify your streams
+
+```bash
+# List existing JetStream streams
+nats stream ls
+
+# List KV buckets (internal stream name: KV_{bucket})
+nats kv ls
+
+# List Object Store buckets (internal stream name: OBJ_{bucket})
+nats object ls
+```
+
+### Step 2: Create a configuration file
+
+Point the sidecar at your existing NATS server and list the streams you want to archive:
+
+```yaml
+nats:
+  url: "nats://your-nats-server:4222"
+  # For authenticated environments:
+  # credentials_file: "/path/to/user.creds"
+  # nkey_seed_file: "/path/to/seed"
+  # tls:
+  #   ca_file: "/path/to/ca.pem"
+  #   cert_file: "/path/to/cert.pem"
+  #   key_file: "/path/to/key.pem"
+
+streams:
+  - name: "ORDERS"                      # your existing stream name
+    consumer_name: "nts-archiver"        # new durable consumer (auto-created)
+    tiers:
+      memory: { enabled: true, max_bytes: "256MB", max_age: "5m" }
+      file:   { enabled: true, data_dir: "/var/lib/nts/data", max_age: "24h" }
+      blob:   { enabled: true, bucket: "my-archive", region: "us-east-1" }
+
+  - name: "KV_config"                   # existing KV bucket → stream name
+    consumer_name: "nts-archiver-kv"
+    kv:
+      index_all_revisions: true
+    tiers:
+      memory: { enabled: true, max_age: "10m" }
+      file:   { enabled: true, data_dir: "/var/lib/nts/data" }
+
+  - name: "OBJ_files"                   # existing Object Store → stream name
+    consumer_name: "nts-archiver-obj"
+    tiers:
+      file: { enabled: true, data_dir: "/var/lib/nts/data" }
+      blob: { enabled: true, bucket: "my-archive", region: "us-east-1" }
+
+block:
+  target_size: "8MB"
+  max_linger: "30s"
+
+metadata:
+  path: "/var/lib/nts/meta.db"
+
+api:
+  enabled: true
+  listen: ":8080"
+  nats_responder:
+    enabled: true
+    subject_prefix: "nts"
+```
+
+### Step 3: Deploy the sidecar
+
+The sidecar can run anywhere that has network access to your NATS server:
+
+```bash
+# Option A: Binary
+make build
+bin/nats-tiered-storage -config /path/to/config.yaml
+
+# Option B: Docker
+docker run -v /path/to/config.yaml:/etc/nts/config.yaml \
+           -v /var/lib/nts:/var/lib/nts \
+           nats-tiered-storage
+
+# Option C: Kubernetes sidecar (same pod as nats-server)
+kubectl apply -f deploy/kubernetes/configmap.yaml
+kubectl apply -f deploy/kubernetes/sidecar-deployment.yaml
+```
+
+### Step 4: Access cold data
+
+Once the sidecar is running, it automatically creates durable Pull Consumers on your streams and begins archiving. You can access archived data in three ways:
+
+**HTTP API** — no application changes needed:
+```bash
+curl -s localhost:8080/v1/messages/ORDERS/12345 | jq .
+curl -s localhost:8080/v1/kv/config/get/app.port | jq .
+curl -so report.pdf localhost:8080/v1/objects/files/get/report.pdf
+```
+
+**NATS request-reply** — works with any NATS client in any language:
+```bash
+nats req nts.get.ORDERS.12345 ""
+nats req nts.kv.config.get.app.port ""
+nats req nts.obj.files.get.report.pdf ""
+```
+
+**Go client library** — transparent fallback with minimal code changes:
+```go
+import "github.com/gftdcojp/nats-tiered-storage/pkg/nts"
+
+// Wrap your existing NATS connection
+client, _ := nts.New(nts.Config{NC: nc, JS: js})
+
+// Replace js.KeyValue() → client.KeyValue()
+// When a key is no longer in JetStream, it falls back to cold storage automatically
+kv, _ := client.KeyValue(ctx, "config")
+entry, _ := kv.Get(ctx, "app.port")
+
+// Replace js.ObjectStore() → client.ObjectStore()
+obs, _ := client.ObjectStore(ctx, "files")
+reader, _ := obs.Get(ctx, "report.pdf")
+```
+
+### How it works with existing streams
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Existing Environment (no changes required)              │
+│                                                         │
+│  Your App ──publish/subscribe──> nats-server (JetStream) │
+│                                      │                  │
+│                                      │ Pull Consumer    │
+│                                      ▼                  │
+│                              nats-tiered-storage        │
+│                              ┌──────────────────┐       │
+│                              │ Memory (hot)     │       │
+│                              │ File   (warm)    │       │
+│                              │ S3     (cold)    │       │
+│                              └──────────────────┘       │
+└─────────────────────────────────────────────────────────┘
+```
+
+Key points:
+
+- The sidecar creates its own **durable Pull Consumer** — it does not interfere with your existing consumers or subscriptions
+- Messages remain in JetStream after the sidecar ACKs them — the sidecar's consumer is independent
+- You can safely set `max_age` or `max_bytes` on JetStream streams to limit retention; the sidecar archives messages before they expire
+- Stream type is auto-detected from the name prefix (`KV_` → kv, `OBJ_` → objectstore)
+
+### Typical use case: extend retention beyond JetStream limits
+
+```
+JetStream:  max_age=7d  (messages deleted after 7 days)
+Sidecar:    archives on ingest → Memory 5m → File 24h → S3 forever
+
+Result: Hot data served from JetStream (fast),
+        cold data served from sidecar (transparent fallback)
+```
+
 ## Deployment
 
 ### Docker

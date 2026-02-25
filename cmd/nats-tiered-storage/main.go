@@ -107,7 +107,7 @@ func run(cfg *config.Config, logger *zap.Logger) error {
 
 		var blobStore tier.TierStore
 		if sc.Tiers.Blob.Enabled && s3Client != nil {
-			blobStore = blob.NewStore(s3Client, sc.Tiers.Blob, logger.Named("blob").With(zap.String("stream", sc.Name)))
+			blobStore = blob.NewStore(s3Client.S3, s3Client.Bucket, sc.Tiers.Blob, logger.Named("blob").With(zap.String("stream", sc.Name)))
 		}
 
 		// Build tier controller

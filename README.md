@@ -549,21 +549,49 @@ Key metrics (prefix `nts_`):
 
 ## Testing
 
+The project has **149 tests** covering all packages with race detection enabled.
+
 ```bash
-# Unit tests
+# All tests (unit + integration + durability)
+go test -race -count=1 ./...
+
+# Unit tests only
 make test
 
 # Integration tests (embedded nats-server, no Docker required)
-go test -race -count=1 -run TestIntegration_FullPipeline ./internal/
-go test -race -count=1 -run TestIntegration_KVStore ./internal/
-go test -race -count=1 -run TestIntegration_ObjectStore ./internal/
+go test -race -count=1 -run TestIntegration ./internal/
 
-# All tests
-go test -race ./...
+# Durability tests (restart survival, CRC, tier transitions, KV/Obj persistence)
+go test -race -count=1 -run TestDurability ./internal/
+
+# Stress tests (high volume, concurrency, rapid tier migration, large blocks)
+go test -race -count=1 -tags stress -run TestStress ./internal/
+
+# Coverage report
+go test -race -coverprofile=coverage.out ./...
+go tool cover -func=coverage.out
 
 # Development stack with Docker Compose
 make dev
 ```
+
+### Test categories
+
+| Category | Tests | Description |
+|---|---|---|
+| Block format | 9 | Encode/decode, builder, index, CRC checksums |
+| Memory store | 8 | LRU eviction, MaxBlocks, concurrent access |
+| File store | 15 | Put/Get, index lookup, corruption fallback, durability |
+| Blob store | 12 | S3 mock, range requests, cache, concurrent race detection |
+| Tier controller | 17 | Ingest, demote, promote, retrieve, policy cycles, concurrency |
+| Lifecycle/GC | 6 | Expiry, retention, partial failure, cancel |
+| HTTP handlers | 12 | Status, blocks, messages, KV, Object Store, errors |
+| Health/Metrics | 7 | Liveness, readiness, NATS/meta checks, Prometheus metrics |
+| Client (`pkg/nts`) | 16 | Error helpers, KV/Obj sidecar fallback, embedded NATS |
+| Integration | 3 | Full pipeline, KV Store, Object Store (end-to-end) |
+| Durability | 7 | BoltDB restart, file restart, CRC, tier transitions, KV/Obj persistence |
+| Stress | 6 | 10K msg ingest, 50-goroutine concurrency, rapid tier migration, 50K msg blocks |
+| Config | 4 | YAML parsing, validation, byte sizes |
 
 ## License
 

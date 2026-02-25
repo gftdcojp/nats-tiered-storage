@@ -6,28 +6,33 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/gftdcojp/nats-tiered-storage/internal/block"
 	"github.com/gftdcojp/nats-tiered-storage/internal/config"
 	"github.com/gftdcojp/nats-tiered-storage/internal/tier"
-	"github.com/gftdcojp/nats-tiered-storage/pkg/s3util"
 	"go.uber.org/zap"
 )
 
 // Store implements tier.TierStore for S3-compatible object storage.
 type Store struct {
-	client *s3util.Client
+	s3     S3API
+	bucket string
 	cfg    config.BlobTierConfig
 	logger *zap.Logger
+
 	// indexCache caches block indexes in memory for efficient single-message lookups.
+	mu         sync.RWMutex
 	indexCache map[string]*block.BlockIndex
 }
 
-func NewStore(client *s3util.Client, cfg config.BlobTierConfig, logger *zap.Logger) *Store {
+// NewStore creates a new blob store using an S3API implementation.
+func NewStore(s3api S3API, bucket string, cfg config.BlobTierConfig, logger *zap.Logger) *Store {
 	return &Store{
-		client:     client,
+		s3:         s3api,
+		bucket:     bucket,
 		cfg:        cfg,
 		logger:     logger,
 		indexCache: make(map[string]*block.BlockIndex),
@@ -60,7 +65,7 @@ func (s *Store) Put(ctx context.Context, ref tier.BlockRef, data *block.Block) e
 	}
 
 	input := &s3.PutObjectInput{
-		Bucket:      &s.client.Bucket,
+		Bucket:      &s.bucket,
 		Key:         &key,
 		Body:        bytes.NewReader(data.Raw),
 		ContentType: aws.String("application/octet-stream"),
@@ -71,7 +76,7 @@ func (s *Store) Put(ctx context.Context, ref tier.BlockRef, data *block.Block) e
 		// StorageClass is set via the types package
 	}
 
-	_, err := s.client.S3.PutObject(ctx, input)
+	_, err := s.s3.PutObject(ctx, input)
 	if err != nil {
 		return fmt.Errorf("uploading block to S3: %w", err)
 	}
@@ -80,8 +85,8 @@ func (s *Store) Put(ctx context.Context, ref tier.BlockRef, data *block.Block) e
 	if data.Index != nil {
 		idxKey := s.indexKey(ref)
 		idxData := data.Index.Encode()
-		_, err := s.client.S3.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:      &s.client.Bucket,
+		_, err := s.s3.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:      &s.bucket,
 			Key:         &idxKey,
 			Body:        bytes.NewReader(idxData),
 			ContentType: aws.String("application/octet-stream"),
@@ -102,8 +107,8 @@ func (s *Store) Put(ctx context.Context, ref tier.BlockRef, data *block.Block) e
 
 func (s *Store) Get(ctx context.Context, ref tier.BlockRef) (*block.Block, error) {
 	key := s.objectKey(ref)
-	resp, err := s.client.S3.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: &s.client.Bucket,
+	resp, err := s.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &s.bucket,
 		Key:    &key,
 	})
 	if err != nil {
@@ -150,13 +155,19 @@ func (s *Store) GetMessage(ctx context.Context, ref tier.BlockRef, seq uint64) (
 
 func (s *Store) getBlockIndex(ctx context.Context, ref tier.BlockRef) (*block.BlockIndex, error) {
 	cacheKey := fmt.Sprintf("%s/%d", ref.Stream, ref.BlockID)
+
+	// Check cache with read lock
+	s.mu.RLock()
 	if idx, ok := s.indexCache[cacheKey]; ok {
+		s.mu.RUnlock()
 		return idx, nil
 	}
+	s.mu.RUnlock()
 
+	// Download index from S3
 	idxKey := s.indexKey(ref)
-	resp, err := s.client.S3.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: &s.client.Bucket,
+	resp, err := s.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &s.bucket,
 		Key:    &idxKey,
 	})
 	if err != nil {
@@ -174,7 +185,11 @@ func (s *Store) getBlockIndex(ctx context.Context, ref tier.BlockRef) (*block.Bl
 		return nil, err
 	}
 
+	// Store in cache with write lock
+	s.mu.Lock()
 	s.indexCache[cacheKey] = idx
+	s.mu.Unlock()
+
 	return idx, nil
 }
 
@@ -182,8 +197,8 @@ func (s *Store) readMessageRange(ctx context.Context, ref tier.BlockRef, offset 
 	key := s.objectKey(ref)
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+int64(size)-1)
 
-	resp, err := s.client.S3.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: &s.client.Bucket,
+	resp, err := s.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &s.bucket,
 		Key:    &key,
 		Range:  &rangeHeader,
 	})
@@ -213,8 +228,8 @@ func (s *Store) readMessageRange(ctx context.Context, ref tier.BlockRef, offset 
 
 func (s *Store) Delete(ctx context.Context, ref tier.BlockRef) error {
 	key := s.objectKey(ref)
-	_, err := s.client.S3.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: &s.client.Bucket,
+	_, err := s.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: &s.bucket,
 		Key:    &key,
 	})
 	if err != nil {
@@ -223,22 +238,24 @@ func (s *Store) Delete(ctx context.Context, ref tier.BlockRef) error {
 
 	// Also delete index
 	idxKey := s.indexKey(ref)
-	s.client.S3.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: &s.client.Bucket,
+	s.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: &s.bucket,
 		Key:    &idxKey,
 	})
 
 	// Remove from cache
 	cacheKey := fmt.Sprintf("%s/%d", ref.Stream, ref.BlockID)
+	s.mu.Lock()
 	delete(s.indexCache, cacheKey)
+	s.mu.Unlock()
 
 	return nil
 }
 
 func (s *Store) Exists(ctx context.Context, ref tier.BlockRef) (bool, error) {
 	key := s.objectKey(ref)
-	_, err := s.client.S3.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: &s.client.Bucket,
+	_, err := s.s3.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: &s.bucket,
 		Key:    &key,
 	})
 	if err != nil {
@@ -255,6 +272,8 @@ func (s *Store) Stats(_ context.Context) (tier.TierStats, error) {
 }
 
 func (s *Store) Close() error {
+	s.mu.Lock()
 	s.indexCache = nil
+	s.mu.Unlock()
 	return nil
 }

@@ -12,7 +12,7 @@ NATS JetStream does not natively support tiered storage — a feature long reque
 
 `nats-tiered-storage` runs as a sidecar alongside `nats-server` and transparently
 moves data between tiers — keeping hot data in memory, warm data on local disk,
-and cold data in S3-compatible object storage.
+and cold data in S3-compatible object storage. It also supports **KV Store** and **Object Store** tiering with transparent client-side fallback.
 
 ## Architecture
 
@@ -46,11 +46,14 @@ Clients ──> nats-server <────>  |  ┌──────────
 | 3-tier hierarchy | Memory (LRU) → File (local disk) → Blob (S3/MinIO/R2) |
 | Policy-based demotion | Age, size, and block-count thresholds per tier |
 | On-demand promotion | Cold reads automatically warm data back into hotter tiers |
-| HTTP REST API | Query messages, list blocks, trigger demote/promote |
-| NATS request-reply | `nats req nts.get.{stream}.{seq} ""` |
-| Prometheus metrics | `nts_*` metrics for ingestion, tier usage, latency |
+| KV Store support | Key-based indexing, revision history, prefix scan for `KV_*` streams |
+| Object Store support | Chunk reassembly, metadata indexing for `OBJ_*` streams |
+| Transparent client | `pkg/nts` library wraps JetStream with automatic cold fallback |
+| HTTP REST API | Query messages, KV keys, objects, list blocks, trigger demote/promote |
+| NATS request-reply | `nts.get.*`, `nts.kv.*`, `nts.obj.*` subjects |
+| Prometheus metrics | `nts_*` metrics for ingestion, tier usage, KV/Object ops, latency |
 | Health checks | Liveness (`/healthz`) and readiness (`/readyz`) endpoints |
-| Management CLI | `nts-ctl` for inspecting streams, blocks, and tier state |
+| Management CLI | `nts-ctl` for inspecting streams, blocks, KV keys, and objects |
 | Multi-stream | Configure independent policies per JetStream stream |
 | Graceful shutdown | Flushes partial blocks on SIGINT/SIGTERM |
 
@@ -106,6 +109,75 @@ nts-ctl -addr http://localhost:8080 streams
 nts-ctl -addr http://localhost:8080 blocks ORDERS
 ```
 
+### KV Store tiering
+
+```bash
+# Create a KV bucket and put some keys
+nats kv add config --history=5
+nats kv put config app.port "8080"
+nats kv put config app.port "9090"
+nats kv put config app.host "localhost"
+
+# After the sidecar archives them, query via cold storage:
+curl -s localhost:8080/v1/kv/config/get/app.port | jq .
+curl -s localhost:8080/v1/kv/config/keys | jq .
+curl -s localhost:8080/v1/kv/config/history/app.port | jq .
+
+# Or via NATS
+nats req nts.kv.config.get.app.port ""
+nats req nts.kv.config.keys ""
+
+# CLI
+nts-ctl kv get config app.port
+nts-ctl kv keys config
+nts-ctl kv history config app.port
+```
+
+### Object Store tiering
+
+```bash
+# Create an Object Store bucket and put a file
+nats object add files
+nats object put files /path/to/report.pdf --name=report.pdf
+
+# After archival, retrieve via cold storage:
+curl -s localhost:8080/v1/objects/files/info/report.pdf | jq .
+curl -so report.pdf localhost:8080/v1/objects/files/get/report.pdf
+curl -s localhost:8080/v1/objects/files/list | jq .
+
+# Or via NATS
+nats req nts.obj.files.info.report.pdf ""
+nats req nts.obj.files.list ""
+
+# CLI
+nts-ctl obj info files report.pdf
+nts-ctl obj list files
+nts-ctl obj get files report.pdf > report.pdf
+```
+
+### Transparent client library (`pkg/nts`)
+
+For Go applications, the `pkg/nts` library wraps `jetstream.KeyValue` and `jetstream.ObjectStore` with automatic fallback to cold storage:
+
+```go
+import "github.com/gftdcojp/nats-tiered-storage/pkg/nts"
+
+client, _ := nts.New(nts.Config{NC: nc, JS: js})
+
+// KV — falls back to sidecar when key is not in JetStream
+kv, _ := client.KeyValue(ctx, "config")
+entry, _ := kv.Get(ctx, "app.port")  // returns from cold storage transparently
+fmt.Println(string(entry.Value()))    // "9090"
+
+// Object Store — reassembles chunks from cold storage
+obs, _ := client.ObjectStore(ctx, "files")
+reader, _ := obs.Get(ctx, "report.pdf")
+io.Copy(dst, reader)
+
+// Direct message retrieval
+msg, _ := client.GetMessage(ctx, "ORDERS", 42)
+```
+
 ## Configuration
 
 Configuration is via YAML file. See [`configs/example.yaml`](configs/example.yaml) for a full reference.
@@ -117,22 +189,29 @@ nats:
   url: "nats://localhost:4222"
 
 streams:
+  # Regular stream (auto-detected)
   - name: "ORDERS"
     consumer_name: "nts-archiver"
     tiers:
-      memory:
-        enabled: true
-        max_bytes: "256MB"
-        max_age: "5m"
-      file:
-        enabled: true
-        data_dir: "/var/lib/nts/data"
-        max_bytes: "10GB"
-        max_age: "24h"
-      blob:
-        enabled: true
-        bucket: "nats-tiered-archive"
-        region: "us-east-1"
+      memory: { enabled: true, max_bytes: "256MB", max_age: "5m" }
+      file:   { enabled: true, data_dir: "/var/lib/nts/data", max_age: "24h" }
+      blob:   { enabled: true, bucket: "nats-tiered-archive", region: "us-east-1" }
+
+  # KV Store (auto-detected from KV_ prefix)
+  - name: "KV_config"
+    consumer_name: "nts-archiver-kv"
+    kv:
+      index_all_revisions: true  # keep full history
+    tiers:
+      memory: { enabled: true, max_age: "10m" }
+      file:   { enabled: true, data_dir: "/var/lib/nts/data" }
+
+  # Object Store (auto-detected from OBJ_ prefix)
+  - name: "OBJ_files"
+    consumer_name: "nts-archiver-obj"
+    tiers:
+      file: { enabled: true, data_dir: "/var/lib/nts/data" }
+      blob: { enabled: true, bucket: "nats-archive", region: "us-east-1" }
 
 block:
   target_size: "8MB"
@@ -141,6 +220,8 @@ block:
 metadata:
   path: "/var/lib/nts/meta.db"
 ```
+
+Stream types are auto-detected from the name prefix (`KV_` → kv, `OBJ_` → objectstore), or can be set explicitly with the `type` field.
 
 ### Key settings
 
@@ -157,6 +238,8 @@ metadata:
 
 ## HTTP API
 
+### Stream / Block APIs
+
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/v1/status` | Service status |
@@ -168,6 +251,34 @@ metadata:
 | `GET` | `/v1/blocks/{stream}/{blockID}` | Get block metadata |
 | `POST` | `/v1/admin/demote/{stream}/{blockID}` | Demote a block to the next colder tier |
 | `POST` | `/v1/admin/promote/{stream}/{blockID}` | Promote a block to the next hotter tier |
+
+### KV Store APIs
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/v1/kv/{bucket}/get/{key}` | Get latest value for a key |
+| `GET` | `/v1/kv/{bucket}/keys?prefix=...` | List keys (optionally filtered by prefix) |
+| `GET` | `/v1/kv/{bucket}/history/{key}` | Get all revisions of a key |
+
+### Object Store APIs
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/v1/objects/{bucket}/get/{name}` | Download object (binary streaming) |
+| `GET` | `/v1/objects/{bucket}/info/{name}` | Get object metadata |
+| `GET` | `/v1/objects/{bucket}/list` | List all objects |
+
+### NATS Request-Reply Subjects
+
+| Subject | Description |
+|---|---|
+| `nts.get.{stream}.{seq}` | Retrieve message by sequence |
+| `nts.kv.{bucket}.get.{key}` | Get KV value |
+| `nts.kv.{bucket}.keys` | List KV keys |
+| `nts.kv.{bucket}.history.{key}` | Get KV key history |
+| `nts.obj.{bucket}.get.{name}` | Get object (reassembled) |
+| `nts.obj.{bucket}.info.{name}` | Get object metadata |
+| `nts.obj.{bucket}.list` | List objects |
 
 ## Data Flow
 
@@ -230,12 +341,18 @@ Key metrics (prefix `nts_`):
 |---|---|---|
 | `nts_messages_ingested_total` | Counter | Total messages ingested |
 | `nts_blocks_sealed_total` | Counter | Total blocks sealed |
-| `nts_blocks_current` | Gauge | Current block count by tier |
-| `nts_bytes_current` | Gauge | Current bytes by tier |
-| `nts_demotions_total` | Counter | Tier demotions |
-| `nts_promotions_total` | Counter | Tier promotions |
+| `nts_tier_block_count` | Gauge | Current block count by tier |
+| `nts_tier_bytes` | Gauge | Current bytes by tier |
+| `nts_demotion_ops_total` | Counter | Tier demotions |
+| `nts_promotion_ops_total` | Counter | Tier promotions |
+| `nts_read_requests_total` | Counter | Read requests by tier |
+| `nts_read_latency_seconds` | Histogram | Read latency by tier |
 | `nts_s3_upload_duration_seconds` | Histogram | S3 upload latency |
-| `nts_consumer_lag` | Gauge | JetStream consumer lag |
+| `nts_kv_index_ops_total` | Counter | KV index operations |
+| `nts_kv_get_requests_total` | Counter | KV sidecar get requests |
+| `nts_obj_index_ops_total` | Counter | Object Store index operations |
+| `nts_obj_get_requests_total` | Counter | Object Store sidecar get requests |
+| `nts_obj_reassembly_duration_seconds` | Histogram | Object chunk reassembly time |
 
 ### Health Checks
 
@@ -251,18 +368,19 @@ Key metrics (prefix `nts_`):
 ├── internal/
 │   ├── block/                  # Block format encoder/decoder, builder, index
 │   ├── blob/                   # S3-compatible blob tier store
-│   ├── config/                 # YAML config parsing and validation
+│   ├── config/                 # YAML config parsing, stream type detection
 │   ├── file/                   # Local file tier store
-│   ├── ingest/                 # JetStream consumer and ingest pipeline
+│   ├── ingest/                 # JetStream consumer, pipeline, KV/Obj classifiers
 │   ├── lifecycle/              # Retention enforcement and GC
 │   ├── memory/                 # In-process LRU memory tier store
-│   ├── meta/                   # BoltDB metadata store
+│   ├── meta/                   # BoltDB metadata (blocks, KV index, Obj index)
 │   ├── metrics/                # Prometheus metrics and health checks
-│   ├── serve/                  # HTTP API and NATS request-reply responder
+│   ├── serve/                  # HTTP + NATS responders (stream, KV, Object Store)
 │   ├── tier/                   # Tier controller and policy engine
 │   └── types/                  # Shared types (Tier, BlockRef, StoredMessage)
 ├── pkg/
 │   ├── natsutil/               # NATS connection helper
+│   ├── nts/                    # Transparent client library (KV/Obj fallback)
 │   └── s3util/                 # S3 client factory
 ├── configs/                    # Example configuration files
 └── deploy/
@@ -276,8 +394,13 @@ Key metrics (prefix `nts_`):
 # Unit tests
 make test
 
-# Integration test (embedded nats-server, no Docker required)
-go test -race -count=1 -run TestIntegration ./internal/
+# Integration tests (embedded nats-server, no Docker required)
+go test -race -count=1 -run TestIntegration_FullPipeline ./internal/
+go test -race -count=1 -run TestIntegration_KVStore ./internal/
+go test -race -count=1 -run TestIntegration_ObjectStore ./internal/
+
+# All tests
+go test -race ./...
 
 # Development stack with Docker Compose
 make dev

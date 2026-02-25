@@ -29,6 +29,36 @@ streams:
         force_path_style: true
         storage_class: "STANDARD"
 
+  - name: "KV_config"
+    consumer_name: "nts-archiver-kv"
+    fetch_batch: 64
+    fetch_timeout: "5s"
+    kv:
+      index_all_revisions: true
+    tiers:
+      memory:
+        enabled: true
+        max_bytes: "32MB"
+        max_age: "5m"
+      file:
+        enabled: true
+        data_dir: "/var/lib/nts/data"
+        max_bytes: "256MB"
+
+  - name: "OBJ_files"
+    consumer_name: "nts-archiver-obj"
+    fetch_batch: 64
+    fetch_timeout: "5s"
+    tiers:
+      memory:
+        enabled: true
+        max_bytes: "64MB"
+        max_age: "5m"
+      file:
+        enabled: true
+        data_dir: "/var/lib/nts/data"
+        max_bytes: "512MB"
+
 block:
   target_size: "1MB"
   max_linger: "10s"

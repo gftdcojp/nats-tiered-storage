@@ -1,9 +1,13 @@
 # nats-tiered-storage
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/gftdcojp/nats-tiered-storage/pkg/nts.svg)](https://pkg.go.dev/github.com/gftdcojp/nats-tiered-storage/pkg/nts)
+[![Go Report Card](https://goreportcard.com/badge/github.com/gftdcojp/nats-tiered-storage)](https://goreportcard.com/report/github.com/gftdcojp/nats-tiered-storage)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 Tiered storage sidecar for [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream).
 Automatically archives JetStream messages through **Memory → File → Blob (S3-compatible)** tiers based on configurable policies.
 
-## Background
+## Why
 
 NATS JetStream does not natively support tiered storage — a feature long requested by the community
 ([#3871](https://github.com/nats-io/nats-server/discussions/3871),
@@ -12,7 +16,49 @@ NATS JetStream does not natively support tiered storage — a feature long reque
 
 `nats-tiered-storage` runs as a sidecar alongside `nats-server` and transparently
 moves data between tiers — keeping hot data in memory, warm data on local disk,
-and cold data in S3-compatible object storage. It also supports **KV Store** and **Object Store** tiering with transparent client-side fallback.
+and cold data in S3-compatible object storage. It supports **Streams**, **KV Store**, and **Object Store** with transparent client-side fallback.
+
+## Install
+
+### Go client library
+
+```bash
+go get github.com/gftdcojp/nats-tiered-storage/pkg/nts@latest
+```
+
+```go
+import "github.com/gftdcojp/nats-tiered-storage/pkg/nts"
+
+client, _ := nts.New(nts.Config{NC: nc, JS: js})
+
+// KV — falls back to sidecar when key is not in JetStream
+kv, _ := client.KeyValue(ctx, "config")
+entry, _ := kv.Get(ctx, "app.port")
+fmt.Println(string(entry.Value()))
+
+// Object Store — reassembles chunks from cold storage
+obs, _ := client.ObjectStore(ctx, "files")
+reader, _ := obs.Get(ctx, "report.pdf")
+io.Copy(dst, reader)
+
+// Direct message retrieval
+msg, _ := client.GetMessage(ctx, "ORDERS", 42)
+```
+
+### Sidecar binary
+
+```bash
+make build
+# bin/nats-tiered-storage   — sidecar daemon
+# bin/nts-ctl               — management CLI
+```
+
+### Docker
+
+```bash
+docker build -t nats-tiered-storage -f deploy/docker/Dockerfile .
+docker run -v /path/to/config.yaml:/etc/nts/config.yaml nats-tiered-storage
+```
 
 ## Architecture
 
@@ -48,7 +94,7 @@ Clients ──> nats-server <────>  |  ┌──────────
 | On-demand promotion | Cold reads automatically warm data back into hotter tiers |
 | KV Store support | Key-based indexing, revision history, prefix scan for `KV_*` streams |
 | Object Store support | Chunk reassembly, metadata indexing for `OBJ_*` streams |
-| Transparent client | `pkg/nts` library wraps JetStream with automatic cold fallback |
+| Transparent client | [`pkg/nts`](https://pkg.go.dev/github.com/gftdcojp/nats-tiered-storage/pkg/nts) library wraps JetStream with automatic cold fallback |
 | HTTP REST API | Query messages, KV keys, objects, list blocks, trigger demote/promote |
 | NATS request-reply | `nts.get.*`, `nts.kv.*`, `nts.obj.*` subjects |
 | Prometheus metrics | `nts_*` metrics for ingestion, tier usage, KV/Object ops, latency |
@@ -64,16 +110,7 @@ Clients ──> nats-server <────>  |  ┌──────────
 - Go 1.22+
 - Docker & Docker Compose (for development stack)
 
-### Build from source
-
-```bash
-make build
-# Outputs: bin/nats-tiered-storage, bin/nts-ctl
-```
-
 ### Run with Docker Compose
-
-The included `docker-compose.yaml` starts a full development stack: nats-server, MinIO, and nats-tiered-storage.
 
 ```bash
 make dev
@@ -87,7 +124,7 @@ This brings up:
 ### Try it out
 
 ```bash
-# Create a stream and publish some messages
+# Create a stream and publish messages
 nats stream add ORDERS --subjects "orders.>" --defaults
 for i in $(seq 1 100); do
   nats pub orders.new "{\"id\": $i}"
@@ -112,74 +149,84 @@ nts-ctl -addr http://localhost:8080 blocks ORDERS
 ### KV Store tiering
 
 ```bash
-# Create a KV bucket and put some keys
 nats kv add config --history=5
 nats kv put config app.port "8080"
-nats kv put config app.port "9090"
 nats kv put config app.host "localhost"
 
-# After the sidecar archives them, query via cold storage:
+# Query via cold storage:
 curl -s localhost:8080/v1/kv/config/get/app.port | jq .
 curl -s localhost:8080/v1/kv/config/keys | jq .
-curl -s localhost:8080/v1/kv/config/history/app.port | jq .
-
-# Or via NATS
 nats req nts.kv.config.get.app.port ""
-nats req nts.kv.config.keys ""
-
-# CLI
-nts-ctl kv get config app.port
 nts-ctl kv keys config
-nts-ctl kv history config app.port
 ```
 
 ### Object Store tiering
 
 ```bash
-# Create an Object Store bucket and put a file
 nats object add files
 nats object put files /path/to/report.pdf --name=report.pdf
 
-# After archival, retrieve via cold storage:
-curl -s localhost:8080/v1/objects/files/info/report.pdf | jq .
+# Retrieve via cold storage:
 curl -so report.pdf localhost:8080/v1/objects/files/get/report.pdf
 curl -s localhost:8080/v1/objects/files/list | jq .
-
-# Or via NATS
 nats req nts.obj.files.info.report.pdf ""
-nats req nts.obj.files.list ""
-
-# CLI
-nts-ctl obj info files report.pdf
 nts-ctl obj list files
-nts-ctl obj get files report.pdf > report.pdf
 ```
 
-### Transparent client library (`pkg/nts`)
+## Client Library (`pkg/nts`)
 
-For Go applications, the `pkg/nts` library wraps `jetstream.KeyValue` and `jetstream.ObjectStore` with automatic fallback to cold storage:
+The [`pkg/nts`](https://pkg.go.dev/github.com/gftdcojp/nats-tiered-storage/pkg/nts) package provides a drop-in wrapper for JetStream with automatic cold storage fallback. It requires only `nats.go` — no other dependencies from this project.
 
 ```bash
-go get github.com/gftdcojp/nats-tiered-storage/pkg/nts
+go get github.com/gftdcojp/nats-tiered-storage/pkg/nts@latest
 ```
 
+### API
+
+| Type | Method | Description |
+|---|---|---|
+| `nts.New(Config)` | — | Create client with NATS conn + JetStream |
+| `Client` | `GetMessage(ctx, stream, seq)` | Retrieve message (cold fallback) |
+| `Client` | `KeyValue(ctx, bucket)` | Open KV store wrapper |
+| `Client` | `ObjectStore(ctx, bucket)` | Open Object Store wrapper |
+| `KVStore` | `Get(ctx, key)` | Get value (cold fallback) |
+| `KVStore` | `Put(ctx, key, value)` | Put value (JetStream direct) |
+| `KVStore` | `Delete(ctx, key)` | Delete key (JetStream direct) |
+| `KVStore` | `Keys(ctx)` | List keys (cold fallback) |
+| `KVStore` | `History(ctx, key)` | Get revisions (cold fallback) |
+| `KVStore` | `Underlying()` | Access raw `jetstream.KeyValue` |
+| `ObjStore` | `Get(ctx, name)` | Download object (cold fallback, chunk reassembly) |
+| `ObjStore` | `GetInfo(ctx, name)` | Object metadata (cold fallback) |
+| `ObjStore` | `Put(ctx, meta, reader)` | Upload object (JetStream direct) |
+| `ObjStore` | `Delete(ctx, name)` | Delete object (JetStream direct) |
+| `ObjStore` | `List(ctx)` | List objects (cold fallback) |
+| `ObjStore` | `Underlying()` | Access raw `jetstream.ObjectStore` |
+
+### How it works
+
+```
+client.KVStore.Get("app.port")
+  │
+  ├─ 1. Try JetStream KV Get
+  │     └─ Found? → return immediately
+  │
+  └─ 2. Not found / deleted / purged
+        └─ NATS Request → nts.kv.{bucket}.get.{key}
+              └─ Sidecar retrieves from Memory / File / S3
+                    └─ Return to caller (transparent)
+```
+
+### Example: migrate existing code
+
 ```go
-import "github.com/gftdcojp/nats-tiered-storage/pkg/nts"
+// Before — standard JetStream
+kv, _ := js.KeyValue(ctx, "config")
+entry, _ := kv.Get(ctx, "app.port")       // fails if purged
 
+// After — transparent cold fallback (2-line change)
 client, _ := nts.New(nts.Config{NC: nc, JS: js})
-
-// KV — falls back to sidecar when key is not in JetStream
 kv, _ := client.KeyValue(ctx, "config")
-entry, _ := kv.Get(ctx, "app.port")  // returns from cold storage transparently
-fmt.Println(string(entry.Value()))    // "9090"
-
-// Object Store — reassembles chunks from cold storage
-obs, _ := client.ObjectStore(ctx, "files")
-reader, _ := obs.Get(ctx, "report.pdf")
-io.Copy(dst, reader)
-
-// Direct message retrieval
-msg, _ := client.GetMessage(ctx, "ORDERS", 42)
+entry, _ := kv.Get(ctx, "app.port")       // falls back to sidecar
 ```
 
 ## Configuration
@@ -193,7 +240,6 @@ nats:
   url: "nats://localhost:4222"
 
 streams:
-  # Regular stream (auto-detected)
   - name: "ORDERS"
     consumer_name: "nts-archiver"
     tiers:
@@ -201,16 +247,13 @@ streams:
       file:   { enabled: true, data_dir: "/var/lib/nts/data", max_age: "24h" }
       blob:   { enabled: true, bucket: "nats-tiered-archive", region: "us-east-1" }
 
-  # KV Store (auto-detected from KV_ prefix)
   - name: "KV_config"
     consumer_name: "nts-archiver-kv"
-    kv:
-      index_all_revisions: true  # keep full history
+    kv: { index_all_revisions: true }
     tiers:
       memory: { enabled: true, max_age: "10m" }
       file:   { enabled: true, data_dir: "/var/lib/nts/data" }
 
-  # Object Store (auto-detected from OBJ_ prefix)
   - name: "OBJ_files"
     consumer_name: "nts-archiver-obj"
     tiers:
@@ -239,6 +282,101 @@ Stream types are auto-detected from the name prefix (`KV_` → kv, `OBJ_` → ob
 | `tiers.memory.max_bytes` | — | Demote oldest memory blocks when total exceeds this |
 | `tiers.file.max_age` | — | Demote file blocks older than this |
 | `tiers.blob.storage_class` | `STANDARD` | S3 storage class (`STANDARD`, `STANDARD_IA`, `GLACIER`) |
+
+## Using with an Existing JetStream Environment
+
+`nats-tiered-storage` is non-invasive — it connects as a standard NATS client and requires **no changes** to your existing `nats-server` or streams.
+
+### Step 1: Identify your streams
+
+```bash
+nats stream ls
+nats kv ls          # internal stream name: KV_{bucket}
+nats object ls      # internal stream name: OBJ_{bucket}
+```
+
+### Step 2: Create a configuration file
+
+```yaml
+nats:
+  url: "nats://your-nats-server:4222"
+  # credentials_file: "/path/to/user.creds"
+  # tls:
+  #   ca_file: "/path/to/ca.pem"
+  #   cert_file: "/path/to/cert.pem"
+  #   key_file: "/path/to/key.pem"
+
+streams:
+  - name: "ORDERS"
+    consumer_name: "nts-archiver"
+    tiers:
+      memory: { enabled: true, max_bytes: "256MB", max_age: "5m" }
+      file:   { enabled: true, data_dir: "/var/lib/nts/data", max_age: "24h" }
+      blob:   { enabled: true, bucket: "my-archive", region: "us-east-1" }
+
+block:
+  target_size: "8MB"
+  max_linger: "30s"
+
+metadata:
+  path: "/var/lib/nts/meta.db"
+
+api:
+  enabled: true
+  listen: ":8080"
+  nats_responder:
+    enabled: true
+    subject_prefix: "nts"
+```
+
+### Step 3: Deploy
+
+```bash
+# Binary
+bin/nats-tiered-storage -config /path/to/config.yaml
+
+# Docker
+docker run -v /path/to/config.yaml:/etc/nts/config.yaml \
+           -v /var/lib/nts:/var/lib/nts \
+           nats-tiered-storage
+
+# Kubernetes
+kubectl apply -f deploy/kubernetes/configmap.yaml
+kubectl apply -f deploy/kubernetes/sidecar-deployment.yaml
+```
+
+### How it works
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Existing Environment (no changes required)              │
+│                                                         │
+│  Your App ──publish/subscribe──> nats-server (JetStream) │
+│                                      │                  │
+│                                      │ Pull Consumer    │
+│                                      ▼                  │
+│                              nats-tiered-storage        │
+│                              ┌──────────────────┐       │
+│                              │ Memory (hot)     │       │
+│                              │ File   (warm)    │       │
+│                              │ S3     (cold)    │       │
+│                              └──────────────────┘       │
+└─────────────────────────────────────────────────────────┘
+```
+
+- The sidecar creates its own **durable Pull Consumer** — it does not interfere with your existing consumers
+- Messages remain in JetStream after the sidecar ACKs them — the sidecar's consumer is independent
+- You can safely set `max_age` or `max_bytes` on JetStream to limit retention; the sidecar archives messages before they expire
+
+### Typical use case
+
+```
+JetStream:  max_age=7d  (messages deleted after 7 days)
+Sidecar:    archives on ingest → Memory 5m → File 24h → S3 forever
+
+Result: Hot data served from JetStream (fast),
+        cold data served from sidecar (transparent fallback)
+```
 
 ## HTTP API
 
@@ -315,185 +453,6 @@ Request → Metadata Lookup → Tier routing
   → Blob hit    → S3 Range Request → return + async promote to file
 ```
 
-## Using with an Existing JetStream Environment
-
-`nats-tiered-storage` is non-invasive — it connects as a standard NATS client and requires **no changes** to your existing `nats-server` or streams.
-
-### Step 1: Identify your streams
-
-```bash
-# List existing JetStream streams
-nats stream ls
-
-# List KV buckets (internal stream name: KV_{bucket})
-nats kv ls
-
-# List Object Store buckets (internal stream name: OBJ_{bucket})
-nats object ls
-```
-
-### Step 2: Create a configuration file
-
-Point the sidecar at your existing NATS server and list the streams you want to archive:
-
-```yaml
-nats:
-  url: "nats://your-nats-server:4222"
-  # For authenticated environments:
-  # credentials_file: "/path/to/user.creds"
-  # nkey_seed_file: "/path/to/seed"
-  # tls:
-  #   ca_file: "/path/to/ca.pem"
-  #   cert_file: "/path/to/cert.pem"
-  #   key_file: "/path/to/key.pem"
-
-streams:
-  - name: "ORDERS"                      # your existing stream name
-    consumer_name: "nts-archiver"        # new durable consumer (auto-created)
-    tiers:
-      memory: { enabled: true, max_bytes: "256MB", max_age: "5m" }
-      file:   { enabled: true, data_dir: "/var/lib/nts/data", max_age: "24h" }
-      blob:   { enabled: true, bucket: "my-archive", region: "us-east-1" }
-
-  - name: "KV_config"                   # existing KV bucket → stream name
-    consumer_name: "nts-archiver-kv"
-    kv:
-      index_all_revisions: true
-    tiers:
-      memory: { enabled: true, max_age: "10m" }
-      file:   { enabled: true, data_dir: "/var/lib/nts/data" }
-
-  - name: "OBJ_files"                   # existing Object Store → stream name
-    consumer_name: "nts-archiver-obj"
-    tiers:
-      file: { enabled: true, data_dir: "/var/lib/nts/data" }
-      blob: { enabled: true, bucket: "my-archive", region: "us-east-1" }
-
-block:
-  target_size: "8MB"
-  max_linger: "30s"
-
-metadata:
-  path: "/var/lib/nts/meta.db"
-
-api:
-  enabled: true
-  listen: ":8080"
-  nats_responder:
-    enabled: true
-    subject_prefix: "nts"
-```
-
-### Step 3: Deploy the sidecar
-
-The sidecar can run anywhere that has network access to your NATS server:
-
-```bash
-# Option A: Binary
-make build
-bin/nats-tiered-storage -config /path/to/config.yaml
-
-# Option B: Docker
-docker run -v /path/to/config.yaml:/etc/nts/config.yaml \
-           -v /var/lib/nts:/var/lib/nts \
-           nats-tiered-storage
-
-# Option C: Kubernetes sidecar (same pod as nats-server)
-kubectl apply -f deploy/kubernetes/configmap.yaml
-kubectl apply -f deploy/kubernetes/sidecar-deployment.yaml
-```
-
-### Step 4: Access cold data
-
-Once the sidecar is running, it automatically creates durable Pull Consumers on your streams and begins archiving. You can access archived data in three ways:
-
-**HTTP API** — no application changes needed:
-```bash
-curl -s localhost:8080/v1/messages/ORDERS/12345 | jq .
-curl -s localhost:8080/v1/kv/config/get/app.port | jq .
-curl -so report.pdf localhost:8080/v1/objects/files/get/report.pdf
-```
-
-**NATS request-reply** — works with any NATS client in any language:
-```bash
-nats req nts.get.ORDERS.12345 ""
-nats req nts.kv.config.get.app.port ""
-nats req nts.obj.files.get.report.pdf ""
-```
-
-**Go client library** — transparent fallback with minimal code changes:
-```go
-import "github.com/gftdcojp/nats-tiered-storage/pkg/nts"
-
-// Wrap your existing NATS connection
-client, _ := nts.New(nts.Config{NC: nc, JS: js})
-
-// Replace js.KeyValue() → client.KeyValue()
-// When a key is no longer in JetStream, it falls back to cold storage automatically
-kv, _ := client.KeyValue(ctx, "config")
-entry, _ := kv.Get(ctx, "app.port")
-
-// Replace js.ObjectStore() → client.ObjectStore()
-obs, _ := client.ObjectStore(ctx, "files")
-reader, _ := obs.Get(ctx, "report.pdf")
-```
-
-### How it works with existing streams
-
-```
-┌─────────────────────────────────────────────────────────┐
-│ Existing Environment (no changes required)              │
-│                                                         │
-│  Your App ──publish/subscribe──> nats-server (JetStream) │
-│                                      │                  │
-│                                      │ Pull Consumer    │
-│                                      ▼                  │
-│                              nats-tiered-storage        │
-│                              ┌──────────────────┐       │
-│                              │ Memory (hot)     │       │
-│                              │ File   (warm)    │       │
-│                              │ S3     (cold)    │       │
-│                              └──────────────────┘       │
-└─────────────────────────────────────────────────────────┘
-```
-
-Key points:
-
-- The sidecar creates its own **durable Pull Consumer** — it does not interfere with your existing consumers or subscriptions
-- Messages remain in JetStream after the sidecar ACKs them — the sidecar's consumer is independent
-- You can safely set `max_age` or `max_bytes` on JetStream streams to limit retention; the sidecar archives messages before they expire
-- Stream type is auto-detected from the name prefix (`KV_` → kv, `OBJ_` → objectstore)
-
-### Typical use case: extend retention beyond JetStream limits
-
-```
-JetStream:  max_age=7d  (messages deleted after 7 days)
-Sidecar:    archives on ingest → Memory 5m → File 24h → S3 forever
-
-Result: Hot data served from JetStream (fast),
-        cold data served from sidecar (transparent fallback)
-```
-
-## Deployment
-
-### Docker
-
-```bash
-docker build -t nats-tiered-storage -f deploy/docker/Dockerfile .
-docker run -v /path/to/config.yaml:/etc/nts/config.yaml nats-tiered-storage
-```
-
-### Kubernetes
-
-Example manifests are provided in [`deploy/kubernetes/`](deploy/kubernetes/).
-
-The sidecar is designed to run alongside `nats-server` in the same pod or as a separate Deployment:
-
-```bash
-kubectl apply -f deploy/kubernetes/configmap.yaml
-kubectl apply -f deploy/kubernetes/sidecar-deployment.yaml
-```
-
 ## Observability
 
 ### Prometheus Metrics
@@ -521,6 +480,44 @@ Key metrics (prefix `nts_`):
 
 - **Liveness**: `GET :8081/healthz` — always returns 200 if the process is running
 - **Readiness**: `GET :8081/readyz` — checks NATS connectivity, metadata store, and S3 (if configured)
+
+## Testing
+
+149 tests covering all packages with race detection.
+
+```bash
+# All tests
+go test -race -count=1 ./...
+
+# Integration tests (embedded nats-server, no Docker required)
+go test -race -count=1 -run TestIntegration ./internal/
+
+# Durability tests (restart survival, CRC, tier transitions)
+go test -race -count=1 -run TestDurability ./internal/
+
+# Stress tests (high volume, concurrency, rapid tier migration)
+go test -race -count=1 -tags stress -run TestStress ./internal/
+
+# Coverage report
+go test -race -coverprofile=coverage.out ./...
+go tool cover -func=coverage.out
+```
+
+| Category | Tests | Description |
+|---|---|---|
+| Block format | 9 | Encode/decode, builder, index, CRC checksums |
+| Memory store | 8 | LRU eviction, MaxBlocks, concurrent access |
+| File store | 15 | Put/Get, index lookup, corruption fallback, durability |
+| Blob store | 12 | S3 mock, range requests, cache, concurrent race detection |
+| Tier controller | 17 | Ingest, demote, promote, retrieve, policy cycles, concurrency |
+| Lifecycle/GC | 6 | Expiry, retention, partial failure, cancel |
+| HTTP handlers | 12 | Status, blocks, messages, KV, Object Store, errors |
+| Health/Metrics | 7 | Liveness, readiness, NATS/meta checks, Prometheus metrics |
+| Client (`pkg/nts`) | 16 | Error helpers, KV/Obj sidecar fallback, embedded NATS |
+| Integration | 3 | Full pipeline, KV Store, Object Store (end-to-end) |
+| Durability | 7 | BoltDB restart, file restart, CRC, tier transitions, KV/Obj persistence |
+| Stress | 6 | 10K msg ingest, 50-goroutine concurrency, rapid tier migration, 50K msg blocks |
+| Config | 4 | YAML parsing, validation, byte sizes |
 
 ## Project Structure
 
@@ -550,52 +547,6 @@ Key metrics (prefix `nts_`):
     ├── docker/                 # Dockerfile and docker-compose
     └── kubernetes/             # K8s manifests
 ```
-
-## Testing
-
-The project has **149 tests** covering all packages with race detection enabled.
-
-```bash
-# All tests (unit + integration + durability)
-go test -race -count=1 ./...
-
-# Unit tests only
-make test
-
-# Integration tests (embedded nats-server, no Docker required)
-go test -race -count=1 -run TestIntegration ./internal/
-
-# Durability tests (restart survival, CRC, tier transitions, KV/Obj persistence)
-go test -race -count=1 -run TestDurability ./internal/
-
-# Stress tests (high volume, concurrency, rapid tier migration, large blocks)
-go test -race -count=1 -tags stress -run TestStress ./internal/
-
-# Coverage report
-go test -race -coverprofile=coverage.out ./...
-go tool cover -func=coverage.out
-
-# Development stack with Docker Compose
-make dev
-```
-
-### Test categories
-
-| Category | Tests | Description |
-|---|---|---|
-| Block format | 9 | Encode/decode, builder, index, CRC checksums |
-| Memory store | 8 | LRU eviction, MaxBlocks, concurrent access |
-| File store | 15 | Put/Get, index lookup, corruption fallback, durability |
-| Blob store | 12 | S3 mock, range requests, cache, concurrent race detection |
-| Tier controller | 17 | Ingest, demote, promote, retrieve, policy cycles, concurrency |
-| Lifecycle/GC | 6 | Expiry, retention, partial failure, cancel |
-| HTTP handlers | 12 | Status, blocks, messages, KV, Object Store, errors |
-| Health/Metrics | 7 | Liveness, readiness, NATS/meta checks, Prometheus metrics |
-| Client (`pkg/nts`) | 16 | Error helpers, KV/Obj sidecar fallback, embedded NATS |
-| Integration | 3 | Full pipeline, KV Store, Object Store (end-to-end) |
-| Durability | 7 | BoltDB restart, file restart, CRC, tier transitions, KV/Obj persistence |
-| Stress | 6 | 10K msg ingest, 50-goroutine concurrency, rapid tier migration, 50K msg blocks |
-| Config | 4 | YAML parsing, validation, byte sizes |
 
 ## License
 

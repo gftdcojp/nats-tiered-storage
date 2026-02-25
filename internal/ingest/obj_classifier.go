@@ -57,15 +57,16 @@ func indexObjBlock(store meta.Store, stream string, blk *block.Block) error {
 
 	for _, msg := range blk.Messages {
 		// Check for metadata messages
-		if bucket, name, ok := ParseObjMetaSubject(msg.Subject); ok {
+		if bucket, _, ok := ParseObjMetaSubject(msg.Subject); ok {
 			var info objectInfo
 			if err := json.Unmarshal(msg.Data, &info); err != nil {
 				// Skip invalid metadata
 				continue
 			}
+			// Use the name from JSON body (subject has base64-encoded name)
 			entry := meta.ObjEntry{
 				Bucket:      bucket,
-				Name:        name,
+				Name:        info.Name,
 				NUID:        info.NUID,
 				Size:        info.Size,
 				Chunks:      info.Chunks,

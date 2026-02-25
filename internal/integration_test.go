@@ -2,9 +2,11 @@ package internal_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	"github.com/gftdcojp/nats-tiered-storage/internal/ingest"
 	"github.com/gftdcojp/nats-tiered-storage/internal/memory"
 	"github.com/gftdcojp/nats-tiered-storage/internal/meta"
+	"github.com/gftdcojp/nats-tiered-storage/internal/serve"
 	"github.com/gftdcojp/nats-tiered-storage/internal/tier"
 	"github.com/gftdcojp/nats-tiered-storage/internal/types"
 	"github.com/nats-io/nats-server/v2/server"
@@ -361,4 +364,405 @@ func TestIntegration_BlockEncodeDecode_RoundTrip(t *testing.T) {
 	}
 
 	t.Log("Block round-trip test PASSED")
+}
+
+// TestIntegration_KVStore tests the complete KV Store flow:
+// create KV bucket -> put keys -> ingest pipeline -> purge from JetStream -> retrieve via sidecar
+func TestIntegration_KVStore(t *testing.T) {
+	_, natsURL := startEmbeddedNATS(t)
+	tmpDir := t.TempDir()
+	logger := zap.NewNop()
+
+	nc, err := nats.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Create KV bucket (this creates the underlying KV_config stream)
+	kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket:  "config",
+		History: 5,
+	})
+	if err != nil {
+		t.Fatalf("create KV bucket: %v", err)
+	}
+
+	// Put some keys with multiple revisions
+	kv.Put(ctx, "app.port", []byte("8080"))
+	kv.Put(ctx, "app.port", []byte("9090"))
+	kv.Put(ctx, "app.host", []byte("localhost"))
+	kv.Put(ctx, "db.url", []byte("postgres://localhost:5432"))
+	kv.Delete(ctx, "db.url") // Delete a key
+
+	t.Log("KV keys published")
+
+	// Initialize meta store
+	metaStore, err := meta.NewBoltStore(filepath.Join(tmpDir, "meta.db"), logger)
+	if err != nil {
+		t.Fatalf("meta store: %v", err)
+	}
+	defer metaStore.Close()
+
+	// Initialize tier stores
+	fileDataDir := filepath.Join(tmpDir, "data")
+	os.MkdirAll(fileDataDir, 0755)
+	memStore := memory.NewStore(config.MemoryTierConfig{
+		Enabled:   true,
+		MaxBytes:  config.ByteSize(64 * 1024 * 1024),
+		MaxBlocks: 10,
+	}, logger)
+	fileStore, _ := file.NewStore(config.FileTierConfig{
+		Enabled: true,
+		DataDir: fileDataDir,
+	}, logger)
+
+	ctrl := tier.NewController(tier.ControllerConfig{
+		Stream: "KV_config",
+		Memory: memStore,
+		File:   fileStore,
+		Meta:   metaStore,
+		Policy: config.TiersConfig{
+			Memory: config.MemoryTierConfig{Enabled: true},
+			File:   config.FileTierConfig{Enabled: true, DataDir: fileDataDir},
+		},
+		Logger: logger,
+	})
+
+	streamCfg := config.StreamConfig{
+		Name:         "KV_config",
+		Type:         config.StreamTypeKV,
+		ConsumerName: "nts-test-kv",
+		FetchBatch:   64,
+		FetchTimeout: config.Duration(2 * time.Second),
+		KV:           config.KVArchiveConfig{IndexAllRevisions: true},
+		Tiers: config.TiersConfig{
+			Memory: config.MemoryTierConfig{Enabled: true},
+			File:   config.FileTierConfig{Enabled: true, DataDir: fileDataDir},
+		},
+	}
+
+	pipeline := ingest.NewPipeline(ingest.PipelineConfig{
+		JS:   js,
+		Ctrl: ctrl,
+		Meta: metaStore,
+		Stream: streamCfg,
+		Block: config.BlockConfig{
+			TargetSize:  config.ByteSize(1024),
+			MaxLinger:   config.Duration(2 * time.Second),
+			Compression: "none",
+		},
+		Logger: logger,
+	})
+
+	// Run ingest pipeline
+	pipeCtx, pipeCancel := context.WithCancel(ctx)
+	pipeDone := make(chan error, 1)
+	go func() { pipeDone <- pipeline.Run(pipeCtx) }()
+
+	// Wait for ingestion
+	time.Sleep(5 * time.Second)
+
+	// --- Verify KV indexes ---
+
+	// Check latest key entry for app.port
+	entry, err := metaStore.LookupKVKey(ctx, "KV_config", "app.port")
+	if err != nil {
+		t.Fatalf("LookupKVKey app.port: %v", err)
+	}
+	t.Logf("KV key app.port: seq=%d op=%s", entry.LastSequence, entry.Operation)
+	if entry.Operation != "PUT" {
+		t.Errorf("app.port operation = %q, want PUT", entry.Operation)
+	}
+
+	// Check that the latest value is "9090" (second put)
+	msg, err := ctrl.Retrieve(ctx, entry.LastSequence)
+	if err != nil {
+		t.Fatalf("retrieve app.port: %v", err)
+	}
+	if string(msg.Data) != "9090" {
+		t.Errorf("app.port value = %q, want 9090", string(msg.Data))
+	}
+
+	// Check db.url was deleted
+	dbEntry, err := metaStore.LookupKVKey(ctx, "KV_config", "db.url")
+	if err != nil {
+		t.Fatalf("LookupKVKey db.url: %v", err)
+	}
+	if dbEntry.Operation != "DEL" {
+		t.Errorf("db.url operation = %q, want DEL", dbEntry.Operation)
+	}
+
+	// Check revisions for app.port (should have 2)
+	revs, err := metaStore.ListKVKeyRevisions(ctx, "KV_config", "app.port")
+	if err != nil {
+		t.Fatalf("ListKVKeyRevisions: %v", err)
+	}
+	t.Logf("app.port revisions: %d", len(revs))
+	if len(revs) != 2 {
+		t.Errorf("expected 2 revisions for app.port, got %d", len(revs))
+	}
+
+	// Check key listing
+	keys, err := metaStore.ListKVKeys(ctx, "KV_config", "app.")
+	if err != nil {
+		t.Fatalf("ListKVKeys: %v", err)
+	}
+	t.Logf("Keys with prefix 'app.': %d", len(keys))
+	if len(keys) != 2 {
+		t.Errorf("expected 2 keys with prefix 'app.', got %d", len(keys))
+	}
+
+	// --- Start NATS KV responder and test sidecar retrieval ---
+	respCtx, respCancel := context.WithCancel(ctx)
+	respDone := make(chan error, 1)
+	go func() {
+		respDone <- serve.RunNATSKVResponder(respCtx, nc, "nts", []config.StreamConfig{streamCfg}, []*ingest.Pipeline{pipeline}, metaStore, logger)
+	}()
+	time.Sleep(500 * time.Millisecond) // wait for subscription
+
+	// Request via NATS
+	resp, err := nc.Request("nts.kv.config.get.app.port", nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("NATS request kv get: %v", err)
+	}
+	var kvResp map[string]interface{}
+	json.Unmarshal(resp.Data, &kvResp)
+	t.Logf("NATS KV get response: %v", kvResp)
+	if kvResp["value"] != "9090" {
+		t.Errorf("NATS KV get value = %v, want 9090", kvResp["value"])
+	}
+
+	// Request keys
+	resp, err = nc.Request("nts.kv.config.keys", nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("NATS request kv keys: %v", err)
+	}
+	var keysList []string
+	json.Unmarshal(resp.Data, &keysList)
+	t.Logf("NATS KV keys response: %v", keysList)
+	// db.url should be filtered out (it's deleted)
+	for _, k := range keysList {
+		if k == "db.url" {
+			t.Error("deleted key db.url should not appear in keys list")
+		}
+	}
+
+	respCancel()
+	<-respDone
+	pipeCancel()
+	<-pipeDone
+
+	t.Log("KV Store integration test PASSED")
+}
+
+// TestIntegration_ObjectStore tests the complete Object Store flow:
+// create Object Store -> put object -> ingest pipeline -> retrieve via sidecar with chunk reassembly
+func TestIntegration_ObjectStore(t *testing.T) {
+	_, natsURL := startEmbeddedNATS(t)
+	tmpDir := t.TempDir()
+	logger := zap.NewNop()
+
+	nc, err := nats.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Create Object Store bucket
+	obs, err := js.CreateObjectStore(ctx, jetstream.ObjectStoreConfig{
+		Bucket: "files",
+	})
+	if err != nil {
+		t.Fatalf("create Object Store: %v", err)
+	}
+
+	// Put an object (will be split into chunks)
+	testData := []byte(strings.Repeat("Hello, NATS Object Store! ", 100)) // ~2.6KB
+	_, err = obs.Put(ctx, jetstream.ObjectMeta{Name: "test-doc.txt"}, strings.NewReader(string(testData)))
+	if err != nil {
+		t.Fatalf("put object: %v", err)
+	}
+	t.Logf("Put object test-doc.txt (%d bytes)", len(testData))
+
+	// Initialize meta store
+	metaStore, err := meta.NewBoltStore(filepath.Join(tmpDir, "meta.db"), logger)
+	if err != nil {
+		t.Fatalf("meta store: %v", err)
+	}
+	defer metaStore.Close()
+
+	// Initialize tier stores
+	fileDataDir := filepath.Join(tmpDir, "data")
+	os.MkdirAll(fileDataDir, 0755)
+	memStore := memory.NewStore(config.MemoryTierConfig{
+		Enabled:   true,
+		MaxBytes:  config.ByteSize(64 * 1024 * 1024),
+		MaxBlocks: 10,
+	}, logger)
+	fileStore, _ := file.NewStore(config.FileTierConfig{
+		Enabled: true,
+		DataDir: fileDataDir,
+	}, logger)
+
+	ctrl := tier.NewController(tier.ControllerConfig{
+		Stream: "OBJ_files",
+		Memory: memStore,
+		File:   fileStore,
+		Meta:   metaStore,
+		Policy: config.TiersConfig{
+			Memory: config.MemoryTierConfig{Enabled: true},
+			File:   config.FileTierConfig{Enabled: true, DataDir: fileDataDir},
+		},
+		Logger: logger,
+	})
+
+	streamCfg := config.StreamConfig{
+		Name:         "OBJ_files",
+		Type:         config.StreamTypeObjectStore,
+		ConsumerName: "nts-test-obj",
+		FetchBatch:   64,
+		FetchTimeout: config.Duration(2 * time.Second),
+		Tiers: config.TiersConfig{
+			Memory: config.MemoryTierConfig{Enabled: true},
+			File:   config.FileTierConfig{Enabled: true, DataDir: fileDataDir},
+		},
+	}
+
+	pipeline := ingest.NewPipeline(ingest.PipelineConfig{
+		JS:   js,
+		Ctrl: ctrl,
+		Meta: metaStore,
+		Stream: streamCfg,
+		Block: config.BlockConfig{
+			TargetSize:  config.ByteSize(8 * 1024 * 1024), // 8MB to fit all in one block
+			MaxLinger:   config.Duration(2 * time.Second),
+			Compression: "none",
+		},
+		Logger: logger,
+	})
+
+	// Run ingest pipeline
+	pipeCtx, pipeCancel := context.WithCancel(ctx)
+	pipeDone := make(chan error, 1)
+	go func() { pipeDone <- pipeline.Run(pipeCtx) }()
+
+	// Wait for ingestion
+	time.Sleep(5 * time.Second)
+
+	// --- Verify Object Store indexes ---
+
+	// Check object metadata
+	objEntry, err := metaStore.LookupObj(ctx, "OBJ_files", "test-doc.txt")
+	if err != nil {
+		t.Fatalf("LookupObj test-doc.txt: %v", err)
+	}
+	t.Logf("Object: name=%s nuid=%s size=%d chunks=%d digest=%s",
+		objEntry.Name, objEntry.NUID, objEntry.Size, objEntry.Chunks, objEntry.Digest)
+	if objEntry.Name != "test-doc.txt" {
+		t.Errorf("object name = %q, want test-doc.txt", objEntry.Name)
+	}
+	if objEntry.Deleted {
+		t.Error("object should not be marked as deleted")
+	}
+
+	// Check chunk index
+	chunks, err := metaStore.LookupObjChunks(ctx, "OBJ_files", objEntry.NUID)
+	if err != nil {
+		t.Fatalf("LookupObjChunks: %v", err)
+	}
+	t.Logf("Chunks: nuid=%s count=%d total_size=%d", chunks.NUID, len(chunks.ChunkSeqs), chunks.TotalSize)
+	if len(chunks.ChunkSeqs) == 0 {
+		t.Fatal("expected at least 1 chunk")
+	}
+
+	// Check object listing
+	objects, err := metaStore.ListObjects(ctx, "OBJ_files")
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	if len(objects) != 1 {
+		t.Errorf("expected 1 object, got %d", len(objects))
+	}
+
+	// --- Start NATS Obj responder and test chunk reassembly ---
+	respCtx, respCancel := context.WithCancel(ctx)
+	respDone := make(chan error, 1)
+	go func() {
+		respDone <- serve.RunNATSObjResponder(respCtx, nc, "nts", []config.StreamConfig{streamCfg}, []*ingest.Pipeline{pipeline}, metaStore, logger)
+	}()
+	time.Sleep(500 * time.Millisecond)
+
+	// Request object info via NATS
+	resp, err := nc.Request("nts.obj.files.info.test-doc.txt", nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("NATS request obj info: %v", err)
+	}
+	var infoResp map[string]interface{}
+	json.Unmarshal(resp.Data, &infoResp)
+	t.Logf("NATS Obj info response: name=%v size=%v chunks=%v", infoResp["name"], infoResp["size"], infoResp["chunks"])
+
+	// Request reassembled object via NATS
+	resp, err = nc.Request("nts.obj.files.get.test-doc.txt", nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("NATS request obj get: %v", err)
+	}
+
+	// Check if it's an error response
+	if len(resp.Data) > 0 && resp.Data[0] == '{' {
+		var errResp map[string]string
+		if json.Unmarshal(resp.Data, &errResp) == nil && errResp["error"] != "" {
+			t.Fatalf("NATS obj get returned error: %s", errResp["error"])
+		}
+	}
+
+	t.Logf("NATS Obj get response: %d bytes", len(resp.Data))
+	if string(resp.Data) != string(testData) {
+		t.Errorf("reassembled object data mismatch: got %d bytes, want %d bytes",
+			len(resp.Data), len(testData))
+		// Show first 100 bytes of each for debugging
+		got := string(resp.Data)
+		want := string(testData)
+		if len(got) > 100 {
+			got = got[:100]
+		}
+		if len(want) > 100 {
+			want = want[:100]
+		}
+		t.Logf("  got:  %q...", got)
+		t.Logf("  want: %q...", want)
+	}
+
+	// Request object list via NATS
+	resp, err = nc.Request("nts.obj.files.list", nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("NATS request obj list: %v", err)
+	}
+	var listResp []map[string]interface{}
+	json.Unmarshal(resp.Data, &listResp)
+	t.Logf("NATS Obj list: %d objects", len(listResp))
+	if len(listResp) != 1 {
+		t.Errorf("expected 1 object in list, got %d", len(listResp))
+	}
+
+	respCancel()
+	<-respDone
+	pipeCancel()
+	<-pipeDone
+
+	t.Log("Object Store integration test PASSED")
 }

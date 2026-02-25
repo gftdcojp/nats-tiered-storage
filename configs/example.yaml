@@ -14,7 +14,9 @@ nats:
   reconnect_wait: "2s"
 
 streams:
+  # Regular JetStream stream (auto-detected from name)
   - name: "ORDERS"
+    # type: "stream"   # auto-detected (no KV_/OBJ_ prefix)
     # subjects: ["orders.>"]
     consumer_name: "nts-archiver"
     fetch_batch: 256
@@ -46,6 +48,27 @@ streams:
         storage_class: "STANDARD"
         max_age: "0"              # 0 = retain forever
         multipart: true
+
+  # KV Store stream (auto-detected from KV_ prefix)
+  # - name: "KV_config"
+  #   # type: "kv"   # auto-detected from KV_ prefix
+  #   consumer_name: "nts-archiver-kv-config"
+  #   kv:
+  #     # bucket_name: "config"  # auto-derived from stream name
+  #     index_all_revisions: true
+  #   tiers:
+  #     memory: { enabled: true, max_age: "10m" }
+  #     file:   { enabled: true, data_dir: "/var/lib/nts/data" }
+
+  # Object Store stream (auto-detected from OBJ_ prefix)
+  # - name: "OBJ_files"
+  #   # type: "objectstore"   # auto-detected from OBJ_ prefix
+  #   consumer_name: "nts-archiver-obj-files"
+  #   objectstore:
+  #     # bucket_name: "files"  # auto-derived from stream name
+  #   tiers:
+  #     file: { enabled: true, data_dir: "/var/lib/nts/data" }
+  #     blob: { enabled: true, bucket: "nats-archive", region: "us-east-1", endpoint: "https://s3.amazonaws.com" }
 
 block:
   target_size: "8MB"

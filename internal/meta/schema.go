@@ -19,9 +19,15 @@ var (
 	subBucketConsumer   = []byte("consumer_state")
 	keyLastAckedSeq     = []byte("last_acked_seq")
 	keyLastAckedTS      = []byte("last_acked_ts")
+
+	// Schema v2: KV and Object Store indexes
+	subBucketKVKeyIndex    = []byte("kv_key_index")
+	subBucketKVRevIndex    = []byte("kv_rev_index")
+	subBucketObjIndex      = []byte("obj_index")
+	subBucketObjChunkIndex = []byte("obj_chunk_index")
 )
 
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 // BlockEntry is the metadata record for a single block.
 type BlockEntry struct {

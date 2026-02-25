@@ -211,6 +211,18 @@ func (p *Pipeline) sealAndIngest(ctx context.Context) error {
 		p.logger.Warn("failed to persist consumer state", zap.Error(err))
 	}
 
+	// Secondary indexing for KV and Object Store streams
+	switch p.streamCfg.ResolvedType() {
+	case config.StreamTypeKV:
+		if err := indexKVBlock(p.meta, p.streamCfg.Name, blk, p.streamCfg.KV.IndexAllRevisions); err != nil {
+			p.logger.Warn("KV indexing failed", zap.Error(err))
+		}
+	case config.StreamTypeObjectStore:
+		if err := indexObjBlock(p.meta, p.streamCfg.Name, blk); err != nil {
+			p.logger.Warn("Object Store indexing failed", zap.Error(err))
+		}
+	}
+
 	p.logger.Info("block sealed and ingested",
 		zap.Uint64("block_id", blk.ID),
 		zap.Uint64("first_seq", blk.FirstSeq),

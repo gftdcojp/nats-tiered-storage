@@ -53,6 +53,10 @@ func main() {
 			os.Exit(1)
 		}
 		cmdPromote(*addr, args[1], args[2])
+	case "kv":
+		cmdKV(*addr, args[1:])
+	case "obj":
+		cmdObj(*addr, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
 		printUsage()
@@ -67,13 +71,19 @@ Usage:
   nts-ctl [flags] <command> [args]
 
 Commands:
-  status                  Show overall status
-  streams                 List managed streams
-  stream info <name>      Show tier breakdown for a stream
-  blocks <stream>         List all blocks with tier info
-  demote <stream> <id>    Force-demote a specific block
-  promote <stream> <id>   Force-promote a specific block
-  version                 Show version
+  status                        Show overall status
+  streams                       List managed streams
+  stream info <name>            Show tier breakdown for a stream
+  blocks <stream>               List all blocks with tier info
+  demote <stream> <id>          Force-demote a specific block
+  promote <stream> <id>         Force-promote a specific block
+  kv get <bucket> <key>         Get a KV value from cold storage
+  kv keys <bucket> [prefix]     List KV keys in cold storage
+  kv history <bucket> <key>     Show key revision history
+  obj get <bucket> <name>       Get an object from cold storage (to stdout)
+  obj info <bucket> <name>      Show object metadata
+  obj list <bucket>             List objects in cold storage
+  version                       Show version
 
 Flags:
   -addr string   API address (default "http://localhost:8080")`)
@@ -164,6 +174,135 @@ func cmdPromote(addr, stream, blockID string) {
 	}
 	defer resp.Body.Close()
 	printJSON(resp.Body)
+}
+
+func cmdKV(addr string, args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: nts-ctl kv <get|keys|history> <bucket> [key|prefix]")
+		os.Exit(1)
+	}
+	op := args[0]
+	bucket := args[1]
+
+	switch op {
+	case "get":
+		if len(args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: nts-ctl kv get <bucket> <key>")
+			os.Exit(1)
+		}
+		resp, err := http.Get(addr + "/v1/kv/" + bucket + "/get/" + args[2])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		printJSON(resp.Body)
+
+	case "keys":
+		url := addr + "/v1/kv/" + bucket + "/keys"
+		if len(args) >= 3 {
+			url += "?prefix=" + args[2]
+		}
+		resp, err := http.Get(url)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+
+		var keys []string
+		if err := json.NewDecoder(resp.Body).Decode(&keys); err != nil {
+			fmt.Fprintf(os.Stderr, "error decoding response: %v\n", err)
+			os.Exit(1)
+		}
+		for _, k := range keys {
+			fmt.Println(k)
+		}
+
+	case "history":
+		if len(args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: nts-ctl kv history <bucket> <key>")
+			os.Exit(1)
+		}
+		resp, err := http.Get(addr + "/v1/kv/" + bucket + "/history/" + args[2])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		printJSON(resp.Body)
+
+	default:
+		fmt.Fprintf(os.Stderr, "unknown kv command: %s\n", op)
+		os.Exit(1)
+	}
+}
+
+func cmdObj(addr string, args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: nts-ctl obj <get|info|list> <bucket> [name]")
+		os.Exit(1)
+	}
+	op := args[0]
+	bucket := args[1]
+
+	switch op {
+	case "get":
+		if len(args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: nts-ctl obj get <bucket> <name>")
+			os.Exit(1)
+		}
+		resp, err := http.Get(addr + "/v1/objects/" + bucket + "/get/" + args[2])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		if resp.Header.Get("Content-Type") == "application/octet-stream" {
+			io.Copy(os.Stdout, resp.Body)
+		} else {
+			printJSON(resp.Body)
+		}
+
+	case "info":
+		if len(args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: nts-ctl obj info <bucket> <name>")
+			os.Exit(1)
+		}
+		resp, err := http.Get(addr + "/v1/objects/" + bucket + "/info/" + args[2])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		printJSON(resp.Body)
+
+	case "list":
+		resp, err := http.Get(addr + "/v1/objects/" + bucket + "/list")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+
+		var objects []map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&objects); err != nil {
+			fmt.Fprintf(os.Stderr, "error decoding response: %v\n", err)
+			os.Exit(1)
+		}
+
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "NAME\tSIZE\tCHUNKS\tDIGEST\tDELETED")
+		for _, o := range objects {
+			fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\n",
+				o["name"], o["size"], o["chunks"], o["digest"], o["deleted"])
+		}
+		w.Flush()
+
+	default:
+		fmt.Fprintf(os.Stderr, "unknown obj command: %s\n", op)
+		os.Exit(1)
+	}
 }
 
 func printJSON(r io.Reader) {

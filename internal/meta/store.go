@@ -25,6 +25,21 @@ type Store interface {
 	DeleteBlock(ctx context.Context, stream string, blockID uint64) error
 	GetConsumerState(ctx context.Context, stream string) (uint64, error)
 	SetConsumerState(ctx context.Context, stream string, seq uint64) error
+
+	// KV Store index methods
+	RecordKVKey(ctx context.Context, stream string, entry KVKeyEntry) error
+	RecordKVRevision(ctx context.Context, stream, key string, entry KVRevEntry) error
+	LookupKVKey(ctx context.Context, stream, key string) (*KVKeyEntry, error)
+	ListKVKeys(ctx context.Context, stream, prefix string) ([]KVKeyEntry, error)
+	ListKVKeyRevisions(ctx context.Context, stream, key string) ([]KVRevEntry, error)
+
+	// Object Store index methods
+	RecordObjMeta(ctx context.Context, stream string, entry ObjEntry) error
+	RecordObjChunks(ctx context.Context, stream string, cs ObjChunkSet) error
+	LookupObj(ctx context.Context, stream, name string) (*ObjEntry, error)
+	LookupObjChunks(ctx context.Context, stream, nuid string) (*ObjChunkSet, error)
+	ListObjects(ctx context.Context, stream string) ([]ObjEntry, error)
+
 	Ping() error
 	Close() error
 }
@@ -52,7 +67,7 @@ func NewBoltStore(path string, logger *zap.Logger) (*BoltStore, error) {
 }
 
 func (s *BoltStore) initSchema() error {
-	return s.db.Update(func(tx *bbolt.Tx) error {
+	if err := s.db.Update(func(tx *bbolt.Tx) error {
 		sys, err := tx.CreateBucketIfNotExists(bucketSystem)
 		if err != nil {
 			return err
@@ -62,7 +77,10 @@ func (s *BoltStore) initSchema() error {
 			return sys.Put(keySchemaVersion, uint64ToBytes(currentSchemaVersion))
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	return s.Migrate()
 }
 
 func (s *BoltStore) ensureStreamBuckets(tx *bbolt.Tx, stream string) (*bbolt.Bucket, error) {
@@ -74,17 +92,19 @@ func (s *BoltStore) ensureStreamBuckets(tx *bbolt.Tx, stream string) (*bbolt.Buc
 	if err != nil {
 		return nil, err
 	}
-	if _, err := sb.CreateBucketIfNotExists(subBucketBlocks); err != nil {
-		return nil, err
-	}
-	if _, err := sb.CreateBucketIfNotExists(subBucketSeqIndex); err != nil {
-		return nil, err
-	}
-	if _, err := sb.CreateBucketIfNotExists(subBucketTimeIndex); err != nil {
-		return nil, err
-	}
-	if _, err := sb.CreateBucketIfNotExists(subBucketConsumer); err != nil {
-		return nil, err
+	for _, name := range [][]byte{
+		subBucketBlocks,
+		subBucketSeqIndex,
+		subBucketTimeIndex,
+		subBucketConsumer,
+		subBucketKVKeyIndex,
+		subBucketKVRevIndex,
+		subBucketObjIndex,
+		subBucketObjChunkIndex,
+	} {
+		if _, err := sb.CreateBucketIfNotExists(name); err != nil {
+			return nil, err
+		}
 	}
 	return sb, nil
 }

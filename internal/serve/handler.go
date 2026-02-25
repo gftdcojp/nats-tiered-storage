@@ -15,22 +15,24 @@ import (
 )
 
 type handler struct {
-	pipelines map[string]*ingest.Pipeline
-	meta      meta.Store
-	logger    *zap.Logger
+	pipelines  map[string]*ingest.Pipeline
+	meta       meta.Store
+	streamCfgs []config.StreamConfig
+	logger     *zap.Logger
 }
 
 // RunHTTP starts the HTTP API server.
-func RunHTTP(ctx context.Context, cfg config.APIConfig, pipelines []*ingest.Pipeline, metaStore meta.Store, logger *zap.Logger) error {
+func RunHTTP(ctx context.Context, cfg config.APIConfig, pipelines []*ingest.Pipeline, streamCfgs []config.StreamConfig, metaStore meta.Store, logger *zap.Logger) error {
 	pipeMap := make(map[string]*ingest.Pipeline)
 	for _, p := range pipelines {
 		pipeMap[p.Stream()] = p
 	}
 
 	h := &handler{
-		pipelines: pipeMap,
-		meta:      metaStore,
-		logger:    logger,
+		pipelines:  pipeMap,
+		meta:       metaStore,
+		streamCfgs: streamCfgs,
+		logger:     logger,
 	}
 
 	mux := http.NewServeMux()
@@ -43,6 +45,10 @@ func RunHTTP(ctx context.Context, cfg config.APIConfig, pipelines []*ingest.Pipe
 	mux.HandleFunc("GET /v1/blocks/{stream}/{blockID}", h.handleGetBlock)
 	mux.HandleFunc("POST /v1/admin/demote/{stream}/{blockID}", h.handleDemote)
 	mux.HandleFunc("POST /v1/admin/promote/{stream}/{blockID}", h.handlePromote)
+
+	// KV and Object Store routes
+	h.registerKVRoutes(mux)
+	h.registerObjRoutes(mux)
 
 	srv := &http.Server{
 		Addr:    cfg.Listen,
@@ -313,6 +319,26 @@ func (h *handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "promoted", "to": prevTier.String()})
+}
+
+// resolveKVBucket finds the stream name and pipeline for a KV bucket name.
+func (h *handler) resolveKVBucket(bucket string) (string, *ingest.Pipeline) {
+	for _, sc := range h.streamCfgs {
+		if sc.ResolvedType() == config.StreamTypeKV && sc.ResolvedKVBucket() == bucket {
+			return sc.Name, h.pipelines[sc.Name]
+		}
+	}
+	return "", nil
+}
+
+// resolveObjBucket finds the stream name and pipeline for an Object Store bucket name.
+func (h *handler) resolveObjBucket(bucket string) (string, *ingest.Pipeline) {
+	for _, sc := range h.streamCfgs {
+		if sc.ResolvedType() == config.StreamTypeObjectStore && sc.ResolvedObjBucket() == bucket {
+			return sc.Name, h.pipelines[sc.Name]
+		}
+	}
+	return "", nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

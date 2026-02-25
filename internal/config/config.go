@@ -34,13 +34,75 @@ type TLSConfig struct {
 	KeyFile  string `yaml:"key_file"`
 }
 
+// StreamType identifies the type of JetStream stream being archived.
+type StreamType string
+
+const (
+	StreamTypeRaw         StreamType = "stream"
+	StreamTypeKV          StreamType = "kv"
+	StreamTypeObjectStore StreamType = "objectstore"
+)
+
 type StreamConfig struct {
-	Name         string       `yaml:"name"`
-	Subjects     []string     `yaml:"subjects"`
-	ConsumerName string       `yaml:"consumer_name"`
-	FetchBatch   int          `yaml:"fetch_batch"`
-	FetchTimeout Duration     `yaml:"fetch_timeout"`
-	Tiers        TiersConfig  `yaml:"tiers"`
+	Name         string           `yaml:"name"`
+	Type         StreamType       `yaml:"type"`
+	Subjects     []string         `yaml:"subjects"`
+	ConsumerName string           `yaml:"consumer_name"`
+	FetchBatch   int              `yaml:"fetch_batch"`
+	FetchTimeout Duration         `yaml:"fetch_timeout"`
+	Tiers        TiersConfig      `yaml:"tiers"`
+	KV           KVArchiveConfig  `yaml:"kv"`
+	ObjectStore  ObjArchiveConfig `yaml:"objectstore"`
+}
+
+type KVArchiveConfig struct {
+	BucketName        string `yaml:"bucket_name"`
+	IndexAllRevisions bool   `yaml:"index_all_revisions"`
+}
+
+type ObjArchiveConfig struct {
+	BucketName string `yaml:"bucket_name"`
+}
+
+// DetectStreamType auto-detects the stream type from the stream name prefix.
+func DetectStreamType(name string) StreamType {
+	if len(name) > 3 && name[:3] == "KV_" {
+		return StreamTypeKV
+	}
+	if len(name) > 4 && name[:4] == "OBJ_" {
+		return StreamTypeObjectStore
+	}
+	return StreamTypeRaw
+}
+
+// ResolvedType returns the stream type, auto-detecting if not explicitly set.
+func (sc *StreamConfig) ResolvedType() StreamType {
+	if sc.Type != "" {
+		return sc.Type
+	}
+	return DetectStreamType(sc.Name)
+}
+
+// ResolvedKVBucket returns the KV bucket name, auto-deriving from stream name.
+func (sc *StreamConfig) ResolvedKVBucket() string {
+	if sc.KV.BucketName != "" {
+		return sc.KV.BucketName
+	}
+	if len(sc.Name) > 3 && sc.Name[:3] == "KV_" {
+		return sc.Name[3:]
+	}
+	return sc.Name
+}
+
+// ResolvedObjBucket returns the Object Store bucket name, auto-deriving from stream name.
+func (sc *StreamConfig) ResolvedObjBucket() string {
+	if sc.ObjectStore.BucketName != "" {
+		return sc.ObjectStore.BucketName
+	}
+	if len(sc.Name) > 4 && sc.Name[:4] == "OBJ_" {
+		return sc.Name[4:]
+	}
+	return sc.Name
 }
 
 type TiersConfig struct {

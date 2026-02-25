@@ -85,6 +85,34 @@ var (
 		Name: "nts_consumer_lag_messages",
 		Help: "Messages pending in JetStream not yet ingested",
 	}, []string{"stream"})
+
+	// KV Store metrics
+	KVIndexOps = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "nts_kv_index_ops_total",
+		Help: "KV index operations (record key, record revision)",
+	}, []string{"stream", "operation"})
+
+	KVGetRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "nts_kv_get_requests_total",
+		Help: "KV get requests via sidecar",
+	}, []string{"bucket", "status"})
+
+	// Object Store metrics
+	ObjIndexOps = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "nts_obj_index_ops_total",
+		Help: "Object Store index operations",
+	}, []string{"stream", "operation"})
+
+	ObjGetRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "nts_obj_get_requests_total",
+		Help: "Object Store get requests via sidecar",
+	}, []string{"bucket", "status"})
+
+	ObjReassemblyDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "nts_obj_reassembly_duration_seconds",
+		Help:    "Time to reassemble object chunks",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1, 5, 10},
+	}, []string{"bucket"})
 )
 
 // RunServer starts the Prometheus metrics HTTP server.

@@ -1,0 +1,50 @@
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 3;
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb local/nats-tiered-archive --ignore-existing;
+      exit 0;
+      "
+
+  nats-tiered-storage:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    depends_on:
+      - nats
+      - minio-init
+    volumes:
+      - ./dev-config.yaml:/etc/nts/config.yaml:ro
+      - nts-data:/var/lib/nts
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+      - "9090:9090"
+
+volumes:
+  minio-data:
+  nts-data:

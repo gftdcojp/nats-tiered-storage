@@ -1,0 +1,56 @@
+# Development configuration for docker-compose
+nats:
+  url: "nats://nats:4222"
+  connection_name: "nats-tiered-storage-dev"
+
+streams:
+  - name: "ORDERS"
+    consumer_name: "nts-archiver"
+    fetch_batch: 64
+    fetch_timeout: "5s"
+    tiers:
+      memory:
+        enabled: true
+        max_bytes: "64MB"
+        max_age: "2m"
+      file:
+        enabled: true
+        data_dir: "/var/lib/nts/data"
+        max_bytes: "512MB"
+        max_age: "10m"
+      blob:
+        enabled: true
+        endpoint: "http://minio:9000"
+        region: "us-east-1"
+        bucket: "nats-tiered-archive"
+        prefix: "dev"
+        access_key_id: "minioadmin"
+        secret_access_key: "minioadmin"
+        force_path_style: true
+        storage_class: "STANDARD"
+
+block:
+  target_size: "1MB"
+  max_linger: "10s"
+  compression: "s2"
+
+metadata:
+  path: "/var/lib/nts/meta.db"
+
+api:
+  enabled: true
+  listen: ":8080"
+  nats_responder:
+    enabled: true
+    subject_prefix: "nts"
+
+observability:
+  metrics:
+    enabled: true
+    listen: ":9090"
+  health:
+    enabled: true
+    listen: ":8081"
+  logging:
+    level: "debug"
+    format: "console"

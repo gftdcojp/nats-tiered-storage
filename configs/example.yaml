@@ -1,0 +1,82 @@
+# nats-tiered-storage configuration example
+# See docs/configuration.md for full reference.
+
+nats:
+  url: "nats://localhost:4222"
+  # credentials_file: "/path/to/creds"
+  # nkey_seed_file: "/path/to/seed"
+  # tls:
+  #   ca_file: "/path/to/ca.pem"
+  #   cert_file: "/path/to/cert.pem"
+  #   key_file: "/path/to/key.pem"
+  connection_name: "nats-tiered-storage"
+  max_reconnects: -1
+  reconnect_wait: "2s"
+
+streams:
+  - name: "ORDERS"
+    # subjects: ["orders.>"]
+    consumer_name: "nts-archiver"
+    fetch_batch: 256
+    fetch_timeout: "5s"
+
+    tiers:
+      memory:
+        enabled: true
+        max_bytes: "256MB"
+        max_blocks: 32
+        max_age: "5m"
+
+      file:
+        enabled: true
+        data_dir: "/var/lib/nts/data"
+        max_bytes: "10GB"
+        max_blocks: 1280
+        max_age: "24h"
+
+      blob:
+        enabled: true
+        endpoint: "https://s3.amazonaws.com"
+        region: "us-east-1"
+        bucket: "nats-tiered-archive"
+        prefix: "prod"
+        # access_key_id: ""       # Or use AWS_ACCESS_KEY_ID env
+        # secret_access_key: ""   # Or use AWS_SECRET_ACCESS_KEY env
+        force_path_style: false
+        storage_class: "STANDARD"
+        max_age: "0"              # 0 = retain forever
+        multipart: true
+
+block:
+  target_size: "8MB"
+  max_linger: "30s"
+  compression: "s2"
+
+policy:
+  eval_interval: "30s"
+
+metadata:
+  path: "/var/lib/nts/meta.db"
+  no_sync: false
+
+api:
+  enabled: true
+  listen: ":8080"
+  nats_responder:
+    enabled: true
+    subject_prefix: "nts"
+
+observability:
+  metrics:
+    enabled: true
+    listen: ":9090"
+    path: "/metrics"
+  health:
+    enabled: true
+    listen: ":8081"
+    liveness_path: "/healthz"
+    readiness_path: "/readyz"
+  logging:
+    level: "info"
+    format: "json"
+    output: "stderr"

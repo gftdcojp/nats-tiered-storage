@@ -1,0 +1,24 @@
+# Minimal nats-tiered-storage configuration
+# Uses defaults for most settings.
+
+nats:
+  url: "nats://localhost:4222"
+
+streams:
+  - name: "ORDERS"
+    consumer_name: "nts-archiver"
+    tiers:
+      memory:
+        enabled: true
+        max_bytes: "128MB"
+        max_age: "5m"
+      file:
+        enabled: true
+        data_dir: "/tmp/nts/data"
+        max_bytes: "1GB"
+        max_age: "1h"
+      blob:
+        enabled: false
+
+metadata:
+  path: "/tmp/nts/meta.db"

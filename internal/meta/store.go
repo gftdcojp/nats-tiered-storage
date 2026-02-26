@@ -16,6 +16,7 @@ import (
 type Store interface {
 	RecordBlock(ctx context.Context, entry BlockEntry) error
 	UpdateTier(ctx context.Context, stream string, blockID uint64, from, to types.Tier) error
+	AddTierPresence(ctx context.Context, stream string, blockID uint64, tier types.Tier) error
 	UpdateS3Key(ctx context.Context, stream string, blockID uint64, s3Key string) error
 	LookupBySequence(ctx context.Context, stream string, seq uint64) (*BlockEntry, error)
 	LookupBySequenceRange(ctx context.Context, stream string, startSeq, endSeq uint64) ([]BlockEntry, error)
@@ -158,7 +159,7 @@ func (s *BoltStore) RecordBlock(_ context.Context, entry BlockEntry) error {
 	})
 }
 
-func (s *BoltStore) UpdateTier(_ context.Context, stream string, blockID uint64, _, to types.Tier) error {
+func (s *BoltStore) UpdateTier(_ context.Context, stream string, blockID uint64, from, _ types.Tier) error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		sb := s.getStreamBucket(tx, stream)
 		if sb == nil {
@@ -176,8 +177,70 @@ func (s *BoltStore) UpdateTier(_ context.Context, stream string, blockID uint64,
 			return err
 		}
 
-		entry.CurrentTier = to
+		// Remove 'from' tier from the Tiers list (write-through eviction).
+		tiers := entry.EffectiveTiers()
+		var updated []types.Tier
+		for _, t := range tiers {
+			if t != from {
+				updated = append(updated, t)
+			}
+		}
+		entry.Tiers = updated
+		if len(updated) > 0 {
+			entry.CurrentTier = updated[0]
+		}
 		entry.DemotedAt = time.Now()
+
+		data, err := encodeBlockEntry(entry)
+		if err != nil {
+			return err
+		}
+
+		return blocks.Put(uint64ToBytes(blockID), data)
+	})
+}
+
+func (s *BoltStore) AddTierPresence(_ context.Context, stream string, blockID uint64, tier types.Tier) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		sb := s.getStreamBucket(tx, stream)
+		if sb == nil {
+			return fmt.Errorf("stream %q not found", stream)
+		}
+
+		blocks := sb.Bucket(subBucketBlocks)
+		raw := blocks.Get(uint64ToBytes(blockID))
+		if raw == nil {
+			return fmt.Errorf("block %d not found in stream %q", blockID, stream)
+		}
+
+		entry, err := decodeBlockEntry(raw)
+		if err != nil {
+			return err
+		}
+
+		// Check if already present.
+		for _, t := range entry.EffectiveTiers() {
+			if t == tier {
+				return nil // idempotent
+			}
+		}
+
+		// Insert in sorted order (hot → cold: Memory=0, File=1, Blob=2).
+		tiers := entry.EffectiveTiers()
+		var updated []types.Tier
+		inserted := false
+		for _, t := range tiers {
+			if !inserted && tier < t {
+				updated = append(updated, tier)
+				inserted = true
+			}
+			updated = append(updated, t)
+		}
+		if !inserted {
+			updated = append(updated, tier)
+		}
+		entry.Tiers = updated
+		entry.CurrentTier = updated[0]
 
 		data, err := encodeBlockEntry(entry)
 		if err != nil {
@@ -350,8 +413,17 @@ func (s *BoltStore) ListBlocks(_ context.Context, stream string, tierFilter *typ
 			if err != nil {
 				return err
 			}
-			if tierFilter != nil && entry.CurrentTier != *tierFilter {
-				return nil
+			if tierFilter != nil {
+				found := false
+				for _, t := range entry.EffectiveTiers() {
+					if t == *tierFilter {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return nil
+				}
 			}
 			entries = append(entries, *entry)
 			return nil

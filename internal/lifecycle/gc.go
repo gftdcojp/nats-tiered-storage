@@ -12,8 +12,8 @@ import (
 	"go.uber.org/zap"
 )
 
-// CollectOrphans finds blocks that exist in metadata but not in any tier store.
-// This can happen if a crash occurs during demotion.
+// CollectOrphans finds blocks that exist in metadata but not in any of their recorded tiers.
+// This can happen if a crash occurs during write-through ingest or eviction.
 func CollectOrphans(ctx context.Context, metaStore meta.Store, ctrl *tier.Controller, stream string, logger *zap.Logger) (int, error) {
 	blocks, err := metaStore.ListBlocks(ctx, stream, nil)
 	if err != nil {
@@ -23,20 +23,26 @@ func CollectOrphans(ctx context.Context, metaStore meta.Store, ctrl *tier.Contro
 	collected := 0
 	for _, blk := range blocks {
 		ref := blk.Ref()
-		store := ctrl.StoreForTier(blk.CurrentTier)
-		if store == nil {
-			continue
+		foundInAny := false
+		for _, t := range blk.EffectiveTiers() {
+			store := ctrl.StoreForTier(t)
+			if store == nil {
+				continue
+			}
+			exists, err := store.Exists(ctx, ref)
+			if err != nil {
+				logger.Warn("error checking block existence",
+					zap.Uint64("block_id", blk.BlockID), zap.String("tier", t.String()), zap.Error(err))
+				continue
+			}
+			if exists {
+				foundInAny = true
+				break
+			}
 		}
-		exists, err := store.Exists(ctx, ref)
-		if err != nil {
-			logger.Warn("error checking block existence",
-				zap.Uint64("block_id", blk.BlockID), zap.Error(err))
-			continue
-		}
-		if !exists {
+		if !foundInAny {
 			logger.Warn("orphaned block metadata found, cleaning up",
-				zap.Uint64("block_id", blk.BlockID),
-				zap.String("tier", blk.CurrentTier.String()))
+				zap.Uint64("block_id", blk.BlockID))
 			if err := metaStore.DeleteBlock(ctx, stream, blk.BlockID); err != nil {
 				logger.Error("failed to delete orphan metadata",
 					zap.Uint64("block_id", blk.BlockID), zap.Error(err))

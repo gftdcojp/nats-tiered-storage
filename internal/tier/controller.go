@@ -49,7 +49,7 @@ func NewController(cfg ControllerConfig) *Controller {
 	}
 }
 
-// Ingest receives a sealed block and places it in the initial tier.
+// Ingest receives a sealed block and writes it to all enabled tiers (write-through).
 func (c *Controller) Ingest(ctx context.Context, blk *block.Block) error {
 	ref := BlockRef{
 		Stream:   c.stream,
@@ -58,24 +58,31 @@ func (c *Controller) Ingest(ctx context.Context, blk *block.Block) error {
 		LastSeq:  blk.LastSeq,
 	}
 
-	// Determine initial tier
-	var initialTier Tier
-	var store TierStore
+	// Write-through: put block in every enabled tier.
+	type tierEntry struct {
+		tier  Tier
+		store TierStore
+	}
+	var targets []tierEntry
 	if c.policy.cfg.Memory.Enabled && c.memory != nil {
-		initialTier = TierMemory
-		store = c.memory
-	} else if c.policy.cfg.File.Enabled && c.file != nil {
-		initialTier = TierFile
-		store = c.file
-	} else if c.policy.cfg.Blob.Enabled && c.blob != nil {
-		initialTier = TierBlob
-		store = c.blob
-	} else {
+		targets = append(targets, tierEntry{TierMemory, c.memory})
+	}
+	if c.policy.cfg.File.Enabled && c.file != nil {
+		targets = append(targets, tierEntry{TierFile, c.file})
+	}
+	if c.policy.cfg.Blob.Enabled && c.blob != nil {
+		targets = append(targets, tierEntry{TierBlob, c.blob})
+	}
+	if len(targets) == 0 {
 		return fmt.Errorf("no enabled tier for stream %s", c.stream)
 	}
 
-	if err := store.Put(ctx, ref, blk); err != nil {
-		return fmt.Errorf("storing block in %s tier: %w", initialTier, err)
+	var tiers []Tier
+	for _, t := range targets {
+		if err := t.store.Put(ctx, ref, blk); err != nil {
+			return fmt.Errorf("storing block in %s tier: %w", t.tier, err)
+		}
+		tiers = append(tiers, t.tier)
 	}
 
 	// Collect subjects
@@ -97,7 +104,8 @@ func (c *Controller) Ingest(ctx context.Context, blk *block.Block) error {
 		LastTS:      blk.LastTS,
 		MsgCount:    blk.MsgCount,
 		SizeBytes:   blk.SizeBytes,
-		CurrentTier: initialTier,
+		CurrentTier: tiers[0],
+		Tiers:       tiers,
 		CreatedAt:   time.Now(),
 		Subjects:    subjectList,
 	}
@@ -106,22 +114,25 @@ func (c *Controller) Ingest(ctx context.Context, blk *block.Block) error {
 		return fmt.Errorf("recording block metadata: %w", err)
 	}
 
-	// Update tier metrics
-	metrics.TierBlockCount.WithLabelValues(c.stream, initialTier.String()).Inc()
-	metrics.TierBytes.WithLabelValues(c.stream, initialTier.String()).Add(float64(blk.SizeBytes))
+	// Update tier metrics for all tiers
+	for _, t := range tiers {
+		metrics.TierBlockCount.WithLabelValues(c.stream, t.String()).Inc()
+		metrics.TierBytes.WithLabelValues(c.stream, t.String()).Add(float64(blk.SizeBytes))
+	}
 
 	c.logger.Info("block ingested",
 		zap.Uint64("block_id", blk.ID),
 		zap.Uint64("first_seq", blk.FirstSeq),
 		zap.Uint64("last_seq", blk.LastSeq),
 		zap.Uint64("msg_count", blk.MsgCount),
-		zap.String("tier", initialTier.String()),
+		zap.Int("tiers", len(tiers)),
 	)
 
 	return nil
 }
 
-// Demote moves a block from a hotter tier to a colder tier.
+// Demote evicts a block from a hotter tier. With write-through, the block
+// already exists in colder tiers, so only deletion from the source is needed.
 func (c *Controller) Demote(ctx context.Context, blockID uint64, from, to Tier) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -132,53 +143,34 @@ func (c *Controller) Demote(ctx context.Context, blockID uint64, from, to Tier) 
 	}
 
 	fromStore := c.storeForTier(from)
-	toStore := c.storeForTier(to)
-	if fromStore == nil || toStore == nil {
-		return fmt.Errorf("tier store not available: from=%s, to=%s", from, to)
+	if fromStore == nil {
+		return fmt.Errorf("tier store not available: from=%s", from)
 	}
 
-	// Read from source
-	blk, err := fromStore.Get(ctx, ref)
-	if err != nil {
-		return fmt.Errorf("reading from %s tier: %w", from, err)
+	// Delete from the hot tier (data already exists in colder tiers via write-through).
+	if err := fromStore.Delete(ctx, ref); err != nil {
+		c.logger.Warn("failed to delete from source tier during eviction",
+			zap.Error(err), zap.Uint64("block_id", blockID), zap.String("from", from.String()))
 	}
 
-	// Write to destination
-	if err := toStore.Put(ctx, ref, blk); err != nil {
-		return fmt.Errorf("writing to %s tier: %w", to, err)
-	}
-
-	// Update S3 key if moving to blob
-	if to == TierBlob {
-		// S3 key is determined by blob store internally
-	}
-
-	// Update metadata
+	// Update metadata: remove 'from' from the Tiers list.
 	if err := c.meta.UpdateTier(ctx, c.stream, blockID, from, to); err != nil {
 		return fmt.Errorf("updating tier metadata: %w", err)
-	}
-
-	// Delete from source
-	if err := fromStore.Delete(ctx, ref); err != nil {
-		c.logger.Warn("failed to delete from source tier after demotion",
-			zap.Error(err), zap.Uint64("block_id", blockID), zap.String("from", from.String()))
 	}
 
 	// Update metrics
 	metrics.DemotionOps.WithLabelValues(c.stream, from.String(), to.String()).Inc()
 	metrics.TierBlockCount.WithLabelValues(c.stream, from.String()).Dec()
-	metrics.TierBlockCount.WithLabelValues(c.stream, to.String()).Inc()
 
-	c.logger.Info("block demoted",
+	c.logger.Info("block evicted from tier",
 		zap.Uint64("block_id", blockID),
 		zap.String("from", from.String()),
-		zap.String("to", to.String()),
 	)
 
 	return nil
 }
 
-// Promote copies a block from a colder to a hotter tier (cache warming).
+// Promote copies a block from a colder to a hotter tier and updates metadata.
 func (c *Controller) Promote(ctx context.Context, blockID uint64, from, to Tier) error {
 	ref, err := c.blockRefFromMeta(ctx, blockID)
 	if err != nil {
@@ -200,9 +192,15 @@ func (c *Controller) Promote(ctx context.Context, blockID uint64, from, to Tier)
 		return err
 	}
 
+	// Record the new tier presence in metadata.
+	if err := c.meta.AddTierPresence(ctx, c.stream, blockID, to); err != nil {
+		c.logger.Warn("failed to update tier presence after promotion",
+			zap.Error(err), zap.Uint64("block_id", blockID))
+	}
+
 	metrics.PromotionOps.WithLabelValues(c.stream, from.String(), to.String()).Inc()
 
-	c.logger.Debug("block promoted (cached)",
+	c.logger.Debug("block promoted",
 		zap.Uint64("block_id", blockID),
 		zap.String("from", from.String()),
 		zap.String("to", to.String()),
@@ -211,7 +209,7 @@ func (c *Controller) Promote(ctx context.Context, blockID uint64, from, to Tier)
 	return nil
 }
 
-// Retrieve finds and returns a message from whatever tier it resides in.
+// Retrieve finds and returns a message by falling through tiers from hottest to coldest.
 func (c *Controller) Retrieve(ctx context.Context, seq uint64) (*StoredMessage, error) {
 	entry, err := c.meta.LookupBySequence(ctx, c.stream, seq)
 	if err != nil {
@@ -219,34 +217,27 @@ func (c *Controller) Retrieve(ctx context.Context, seq uint64) (*StoredMessage, 
 	}
 
 	ref := entry.Ref()
-	tierName := entry.CurrentTier.String()
 	start := time.Now()
 
-	var msg *StoredMessage
-	switch entry.CurrentTier {
-	case TierMemory:
-		msg, err = c.memory.GetMessage(ctx, ref, seq)
-	case TierFile:
-		msg, err = c.file.GetMessage(ctx, ref, seq)
-		if err == nil && c.memory != nil && c.policy.cfg.Memory.Enabled {
-			go c.Promote(context.Background(), entry.BlockID, TierFile, TierMemory)
+	// Try each tier from hottest to coldest until we find the message.
+	for _, t := range entry.EffectiveTiers() {
+		store := c.storeForTier(t)
+		if store == nil {
+			continue
 		}
-	case TierBlob:
-		msg, err = c.blob.GetMessage(ctx, ref, seq)
-		if err == nil && c.file != nil && c.policy.cfg.File.Enabled {
-			go c.Promote(context.Background(), entry.BlockID, TierBlob, TierFile)
+		msg, err := store.GetMessage(ctx, ref, seq)
+		if err == nil {
+			metrics.ReadRequests.WithLabelValues(c.stream, t.String()).Inc()
+			metrics.ReadLatency.WithLabelValues(c.stream, t.String()).Observe(time.Since(start).Seconds())
+			return msg, nil
 		}
-	default:
-		return nil, fmt.Errorf("message not found: seq=%d", seq)
+		// Tier miss (e.g. LRU eviction); fall through to next tier.
 	}
 
-	metrics.ReadRequests.WithLabelValues(c.stream, tierName).Inc()
-	metrics.ReadLatency.WithLabelValues(c.stream, tierName).Observe(time.Since(start).Seconds())
-
-	return msg, err
+	return nil, fmt.Errorf("message not found in any tier: seq=%d", seq)
 }
 
-// RetrieveRange returns messages in a sequence range.
+// RetrieveRange returns messages in a sequence range, falling through tiers.
 func (c *Controller) RetrieveRange(ctx context.Context, startSeq, endSeq uint64) ([]*StoredMessage, error) {
 	entries, err := c.meta.LookupBySequenceRange(ctx, c.stream, startSeq, endSeq)
 	if err != nil {
@@ -256,10 +247,6 @@ func (c *Controller) RetrieveRange(ctx context.Context, startSeq, endSeq uint64)
 	var result []*StoredMessage
 	for _, entry := range entries {
 		ref := entry.Ref()
-		store := c.storeForTier(entry.CurrentTier)
-		if store == nil {
-			continue
-		}
 
 		blockStart := startSeq
 		if entry.FirstSeq > blockStart {
@@ -271,11 +258,22 @@ func (c *Controller) RetrieveRange(ctx context.Context, startSeq, endSeq uint64)
 		}
 
 		for seq := blockStart; seq <= blockEnd; seq++ {
-			msg, err := store.GetMessage(ctx, ref, seq)
-			if err != nil {
+			var found bool
+			for _, t := range entry.EffectiveTiers() {
+				store := c.storeForTier(t)
+				if store == nil {
+					continue
+				}
+				msg, err := store.GetMessage(ctx, ref, seq)
+				if err == nil {
+					result = append(result, msg)
+					found = true
+					break
+				}
+			}
+			if !found {
 				continue
 			}
-			result = append(result, msg)
 		}
 	}
 	return result, nil
@@ -315,27 +313,27 @@ func (c *Controller) demotionCycle(ctx context.Context) error {
 
 	now := time.Now()
 
-	// Memory -> File
-	if c.policy.cfg.Memory.Enabled && c.policy.cfg.File.Enabled {
+	// Evict from memory tier based on policy (data already in colder tiers via write-through).
+	if c.policy.cfg.Memory.Enabled {
 		memTier := TierMemory
 		memBlocks := filterByTier(blocks, memTier)
 		candidates := c.policy.EvaluateDemotion(memBlocks, c.policy.cfg.Memory.MaxAge.Duration(), int64(c.policy.cfg.Memory.MaxBytes), c.policy.cfg.Memory.MaxBlocks, now)
 		for _, blk := range candidates {
 			if err := c.Demote(ctx, blk.BlockID, TierMemory, TierFile); err != nil {
-				c.logger.Error("failed to demote from memory to file",
+				c.logger.Error("failed to evict from memory",
 					zap.Error(err), zap.Uint64("block_id", blk.BlockID))
 			}
 		}
 	}
 
-	// File -> Blob
-	if c.policy.cfg.File.Enabled && c.policy.cfg.Blob.Enabled {
+	// Evict from file tier based on policy (data already in blob tier via write-through).
+	if c.policy.cfg.File.Enabled {
 		fileTier := TierFile
 		fileBlocks := filterByTier(blocks, fileTier)
 		candidates := c.policy.EvaluateDemotion(fileBlocks, c.policy.cfg.File.MaxAge.Duration(), int64(c.policy.cfg.File.MaxBytes), c.policy.cfg.File.MaxBlocks, now)
 		for _, blk := range candidates {
 			if err := c.Demote(ctx, blk.BlockID, TierFile, TierBlob); err != nil {
-				c.logger.Error("failed to demote from file to blob",
+				c.logger.Error("failed to evict from file",
 					zap.Error(err), zap.Uint64("block_id", blk.BlockID))
 			}
 		}
@@ -372,8 +370,11 @@ func (c *Controller) blockRefFromMeta(ctx context.Context, blockID uint64) (Bloc
 func filterByTier(blocks []meta.BlockEntry, t Tier) []meta.BlockEntry {
 	var result []meta.BlockEntry
 	for _, b := range blocks {
-		if b.CurrentTier == t {
-			result = append(result, b)
+		for _, bt := range b.EffectiveTiers() {
+			if bt == t {
+				result = append(result, b)
+				break
+			}
 		}
 	}
 	return result

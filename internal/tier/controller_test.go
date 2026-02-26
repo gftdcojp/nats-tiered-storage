@@ -176,36 +176,64 @@ func TestController_Demote_MemoryToFile(t *testing.T) {
 	}
 }
 
-func TestController_Demote_StoreUnavailable(t *testing.T) {
-	ctrl, _, _, _, _ := newTestController(t, true, false, false)
+func TestController_Demote_EvictsFromMemory(t *testing.T) {
+	// With write-through, Demote only deletes from source tier.
+	ctrl, memStore, fileStore, _, metaStore := newTestController(t, true, true, false)
 	ctx := context.Background()
 	blk := makeBlock(t, 1, "TEST", 1, 5)
 	ctrl.Ingest(ctx, blk)
 
-	err := ctrl.Demote(ctx, 1, TierMemory, TierFile)
-	if err == nil {
-		t.Fatal("expected error when file store is nil")
+	ref := BlockRef{Stream: "TEST", BlockID: 1}
+	// After write-through ingest, both tiers should have the block.
+	if !memStore.hasBlock(ref) || !fileStore.hasBlock(ref) {
+		t.Fatal("block should be in both memory and file after write-through ingest")
+	}
+
+	if err := ctrl.Demote(ctx, 1, TierMemory, TierFile); err != nil {
+		t.Fatal(err)
+	}
+
+	if memStore.hasBlock(ref) {
+		t.Error("block should be evicted from memory after demotion")
+	}
+	if !fileStore.hasBlock(ref) {
+		t.Error("block should remain in file after memory eviction")
+	}
+
+	// Metadata should no longer include memory.
+	entry, _ := metaStore.GetBlock(ctx, "TEST", 1)
+	for _, tier := range entry.EffectiveTiers() {
+		if tier == TierMemory {
+			t.Error("memory should be removed from Tiers after demotion")
+		}
 	}
 }
 
-func TestController_Demote_WriteFailure(t *testing.T) {
+func TestController_Retrieve_FallThrough(t *testing.T) {
 	ctrl, memStore, fileStore, _, _ := newTestController(t, true, true, false)
 	ctx := context.Background()
 	blk := makeBlock(t, 1, "TEST", 1, 5)
 	ctrl.Ingest(ctx, blk)
 
-	// Inject write failure
-	fileStore.putErr = fmt.Errorf("disk full")
+	// Simulate memory LRU eviction by deleting from memory store directly.
+	ref := BlockRef{Stream: "TEST", BlockID: 1}
+	memStore.Delete(ctx, ref)
 
-	err := ctrl.Demote(ctx, 1, TierMemory, TierFile)
-	if err == nil {
-		t.Fatal("expected error from failed put")
+	// Should still retrieve from file tier via fallthrough.
+	msg, err := ctrl.Retrieve(ctx, 3)
+	if err != nil {
+		t.Fatalf("expected fallthrough to file tier, got: %v", err)
+	}
+	if msg.Sequence != 3 {
+		t.Fatalf("expected seq 3, got %d", msg.Sequence)
 	}
 
-	// Source should still have the block
-	ref := BlockRef{Stream: "TEST", BlockID: 1}
-	if !memStore.hasBlock(ref) {
-		t.Error("block should remain in memory after failed demotion")
+	// Also verify no block in memory but present in file.
+	if memStore.hasBlock(ref) {
+		t.Error("block should not be in memory")
+	}
+	if !fileStore.hasBlock(ref) {
+		t.Error("block should be in file")
 	}
 }
 

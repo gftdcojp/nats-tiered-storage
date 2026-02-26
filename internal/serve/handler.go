@@ -86,13 +86,15 @@ func (h *handler) handleStreams(w http.ResponseWriter, r *http.Request) {
 		blocks, _ := h.meta.ListBlocks(r.Context(), name, nil)
 		var memCount, fileCount, blobCount int
 		for _, b := range blocks {
-			switch b.CurrentTier {
-			case 0:
-				memCount++
-			case 1:
-				fileCount++
-			case 2:
-				blobCount++
+			for _, t := range b.EffectiveTiers() {
+				switch t {
+				case 0:
+					memCount++
+				case 1:
+					fileCount++
+				case 2:
+					blobCount++
+				}
 			}
 		}
 		streams = append(streams, map[string]interface{}{
@@ -118,16 +120,18 @@ func (h *handler) handleStreamStats(w http.ResponseWriter, r *http.Request) {
 	var memBytes, fileBytes, blobBytes int64
 	var memCount, fileCount, blobCount int
 	for _, b := range blocks {
-		switch b.CurrentTier {
-		case 0:
-			memCount++
-			memBytes += b.SizeBytes
-		case 1:
-			fileCount++
-			fileBytes += b.SizeBytes
-		case 2:
-			blobCount++
-			blobBytes += b.SizeBytes
+		for _, t := range b.EffectiveTiers() {
+			switch t {
+			case 0:
+				memCount++
+				memBytes += b.SizeBytes
+			case 1:
+				fileCount++
+				fileBytes += b.SizeBytes
+			case 2:
+				blobCount++
+				blobBytes += b.SizeBytes
+			}
 		}
 	}
 
@@ -219,15 +223,20 @@ func (h *handler) handleListBlocks(w http.ResponseWriter, r *http.Request) {
 
 	var result []map[string]interface{}
 	for _, b := range blocks {
+		tierNames := make([]string, 0, len(b.EffectiveTiers()))
+		for _, t := range b.EffectiveTiers() {
+			tierNames = append(tierNames, t.String())
+		}
 		result = append(result, map[string]interface{}{
-			"block_id":  b.BlockID,
-			"first_seq": b.FirstSeq,
-			"last_seq":  b.LastSeq,
-			"msg_count": b.MsgCount,
+			"block_id":   b.BlockID,
+			"first_seq":  b.FirstSeq,
+			"last_seq":   b.LastSeq,
+			"msg_count":  b.MsgCount,
 			"size_bytes": b.SizeBytes,
-			"tier":      b.CurrentTier.String(),
+			"tier":       b.CurrentTier.String(),
+			"tiers":      tierNames,
 			"created_at": b.CreatedAt,
-			"age":       time.Since(b.CreatedAt).String(),
+			"age":        time.Since(b.CreatedAt).String(),
 		})
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -272,18 +281,20 @@ func (h *handler) handleDemote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	nextTier := entry.CurrentTier + 1
-	if nextTier > 2 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "block is already in coldest tier"})
+	tiers := entry.EffectiveTiers()
+	if len(tiers) <= 1 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "block exists in only one tier, cannot evict"})
 		return
 	}
 
-	if err := p.Controller().Demote(r.Context(), blockID, entry.CurrentTier, nextTier); err != nil {
+	hottest := tiers[0]
+	nextTier := tiers[1] // the tier it will fall through to after eviction
+	if err := p.Controller().Demote(r.Context(), blockID, hottest, nextTier); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": "demoted", "to": nextTier.String()})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "evicted", "from": hottest.String()})
 }
 
 func (h *handler) handlePromote(w http.ResponseWriter, r *http.Request) {
@@ -307,13 +318,15 @@ func (h *handler) handlePromote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if entry.CurrentTier == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "block is already in hottest tier"})
+	tiers := entry.EffectiveTiers()
+	hottest := tiers[0]
+	if hottest == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "block is already in hottest tier (memory)"})
 		return
 	}
 
-	prevTier := entry.CurrentTier - 1
-	if err := p.Controller().Promote(r.Context(), blockID, entry.CurrentTier, prevTier); err != nil {
+	prevTier := hottest - 1
+	if err := p.Controller().Promote(r.Context(), blockID, hottest, prevTier); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}

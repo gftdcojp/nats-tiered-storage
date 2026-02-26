@@ -46,7 +46,7 @@ func (m *Manager) Run(ctx context.Context, interval time.Duration) error {
 }
 
 func (m *Manager) gcCycle(ctx context.Context) error {
-	// Enforce blob tier max_age (permanent deletion)
+	// Enforce blob tier max_age (permanent deletion from all tiers).
 	if m.streamCfg.Tiers.Blob.Enabled && m.streamCfg.Tiers.Blob.MaxAge.Duration() > 0 {
 		blobTier := tier.TierBlob
 		blocks, err := m.meta.ListBlocks(ctx, m.streamCfg.Name, &blobTier)
@@ -57,16 +57,19 @@ func (m *Manager) gcCycle(ctx context.Context) error {
 		cutoff := time.Now().Add(-m.streamCfg.Tiers.Blob.MaxAge.Duration())
 		for _, blk := range blocks {
 			if blk.LastTS.Before(cutoff) {
-				m.logger.Info("deleting expired block from blob tier",
+				m.logger.Info("deleting expired block from all tiers",
 					zap.Uint64("block_id", blk.BlockID),
 					zap.Time("last_ts", blk.LastTS),
 					zap.Time("cutoff", cutoff),
 				)
 				ref := blk.Ref()
-				if err := m.ctrl.DeleteFromTier(ctx, ref, tier.TierBlob); err != nil {
-					m.logger.Error("failed to delete expired block",
-						zap.Error(err), zap.Uint64("block_id", blk.BlockID))
-					continue
+				// Delete from every tier that holds this block.
+				for _, t := range blk.EffectiveTiers() {
+					if err := m.ctrl.DeleteFromTier(ctx, ref, t); err != nil {
+						m.logger.Error("failed to delete expired block from tier",
+							zap.Error(err), zap.Uint64("block_id", blk.BlockID),
+							zap.String("tier", t.String()))
+					}
 				}
 				if err := m.meta.DeleteBlock(ctx, m.streamCfg.Name, blk.BlockID); err != nil {
 					m.logger.Error("failed to delete block metadata",

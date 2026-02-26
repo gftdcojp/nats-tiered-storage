@@ -39,11 +39,21 @@ type BlockEntry struct {
 	LastTS      time.Time
 	MsgCount    uint64
 	SizeBytes   int64
-	CurrentTier types.Tier
+	CurrentTier types.Tier   // hottest tier (= Tiers[0]); kept for backward compat
+	Tiers       []types.Tier // all tiers holding this block, hot→cold order
 	S3Key       string
 	CreatedAt   time.Time
 	DemotedAt   time.Time
 	Subjects    []string
+}
+
+// EffectiveTiers returns the list of tiers that hold this block.
+// Falls back to []Tier{CurrentTier} for data written before the Tiers field existed.
+func (e *BlockEntry) EffectiveTiers() []types.Tier {
+	if len(e.Tiers) > 0 {
+		return e.Tiers
+	}
+	return []types.Tier{e.CurrentTier}
 }
 
 // Ref returns a BlockRef for this entry.

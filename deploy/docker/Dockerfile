@@ -1,12 +1,14 @@
 FROM golang:1.25-alpine AS builder
 
+ARG VERSION=dev
+
 WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /nats-tiered-storage ./cmd/nats-tiered-storage
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /nts-ctl ./cmd/nts-ctl
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.version=${VERSION}" -o /nats-tiered-storage ./cmd/nats-tiered-storage
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.version=${VERSION}" -o /nts-ctl ./cmd/nts-ctl
 
 FROM alpine:3.20
 

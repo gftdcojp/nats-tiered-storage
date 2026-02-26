@@ -31,10 +31,21 @@
 //
 // # Architecture
 //
+// The sidecar uses a write-through fan-out strategy: each ingested block is
+// written to all enabled tiers simultaneously (Memory, File, and/or S3). Reads
+// fall through from the hottest to the coldest tier until a hit is found. Policy-
+// based eviction removes blocks from hotter tiers over time, while colder copies
+// remain intact. This eliminates data-copy during demotion and provides automatic
+// fallthrough when a tier has evicted a block (e.g. memory LRU eviction).
+//
 // The client first attempts a native JetStream operation (direct get, KV get, etc.).
 // If the data is not found (purged, expired, or deleted), it falls back to a
-// NATS request-reply call to the nats-tiered-storage sidecar, which retrieves
-// the data from whichever tier currently holds it.
+// NATS request-reply call to the sidecar, which retrieves the data from whichever
+// tier currently holds it.
+//
+// The sidecar handles WorkQueue retention streams transparently: when a WorkQueue
+// stream already has consumers, the sidecar auto-creates a Limits-retention mirror
+// (NTS_MIRROR_{stream}) and consumes from it to avoid consumer conflicts.
 //
 // The subject prefix for sidecar requests defaults to "nts" and can be configured
 // via [Config.SubjectPrefix].

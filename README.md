@@ -2,10 +2,11 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/gftdcojp/nats-tiered-storage/pkg/nts.svg)](https://pkg.go.dev/github.com/gftdcojp/nats-tiered-storage/pkg/nts)
 [![Go Report Card](https://goreportcard.com/badge/github.com/gftdcojp/nats-tiered-storage)](https://goreportcard.com/report/github.com/gftdcojp/nats-tiered-storage)
+[![GHCR](https://img.shields.io/badge/GHCR-v0.3.0-blue)](https://github.com/gftdcojp/nats-tiered-storage/pkgs/container/nats-tiered-storage)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 Tiered storage sidecar for [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream).
-Automatically archives JetStream messages through **Memory → File → Blob (S3-compatible)** tiers based on configurable policies.
+Automatically archives JetStream messages through **Memory → File → Blob (S3-compatible)** tiers using write-through fan-out and configurable eviction policies.
 
 ## Why
 
@@ -15,8 +16,9 @@ NATS JetStream does not natively support tiered storage — a feature long reque
 [#3772](https://github.com/nats-io/nats-server/discussions/3772)).
 
 `nats-tiered-storage` runs as a sidecar alongside `nats-server` and transparently
-moves data between tiers — keeping hot data in memory, warm data on local disk,
-and cold data in S3-compatible object storage. It supports **Streams**, **KV Store**, and **Object Store** with transparent client-side fallback.
+manages data across tiers — writing to all enabled tiers on ingest (write-through)
+and evicting from hotter tiers based on policy. Hot data is served from memory, warm data from local disk,
+and cold data from S3-compatible object storage. It supports **Streams**, **KV Store**, and **Object Store** with transparent client-side fallback.
 
 ## Install
 
@@ -53,7 +55,15 @@ make build
 # bin/nts-ctl               — management CLI
 ```
 
-### Docker
+### Docker (GHCR)
+
+```bash
+docker pull ghcr.io/gftdcojp/nats-tiered-storage:0.3.0
+docker run -v /path/to/config.yaml:/etc/nts/config.yaml \
+  ghcr.io/gftdcojp/nats-tiered-storage:0.3.0
+```
+
+### Docker (local build)
 
 ```bash
 docker build -t nats-tiered-storage -f deploy/docker/Dockerfile .
@@ -81,17 +91,20 @@ Clients ──> nats-server <────>  |  ┌──────────
 ### Design Principles
 
 - **Non-invasive** — connects as a standard NATS client; no server plugins or filesystem hooks
-- **Consumer-based ingest** — uses JetStream durable Pull Consumers to fetch messages
+- **Write-through fan-out** — each ingested block is written to all enabled tiers simultaneously; demotion simply evicts from the hottest tier
+- **Consumer-based ingest** — uses JetStream durable Pull Consumers to fetch messages; automatically mirrors WorkQueue streams to avoid consumer conflicts
 - **Block-aligned writes** — groups messages into ~8 MB blocks before uploading to S3 (minimizes per-request cost)
-- **ACK-after-ingest** — acknowledges messages only after the block is durably stored (no data loss)
+- **ACK-after-ingest** — acknowledges messages only after the block is durably stored in all tiers (no data loss)
 
 ## Features
 
 | Feature | Description |
 |---|---|
 | 3-tier hierarchy | Memory (LRU) → File (local disk) → Blob (S3/MinIO/R2) |
-| Policy-based demotion | Age, size, and block-count thresholds per tier |
-| On-demand promotion | Cold reads automatically warm data back into hotter tiers |
+| Write-through ingest | Blocks written to all enabled tiers simultaneously on ingest |
+| Policy-based eviction | Age, size, and block-count thresholds trigger eviction from hotter tiers |
+| Fallthrough reads | Reads try hottest tier first, automatically fall through on miss |
+| On-demand promotion | Explicitly promote cold blocks back into hotter tiers |
 | KV Store support | Key-based indexing, revision history, prefix scan for `KV_*` streams |
 | Object Store support | Chunk reassembly, metadata indexing for `OBJ_*` streams |
 | Transparent client | [`pkg/nts`](https://pkg.go.dev/github.com/gftdcojp/nats-tiered-storage/pkg/nts) library wraps JetStream with automatic cold fallback |
@@ -100,6 +113,7 @@ Clients ──> nats-server <────>  |  ┌──────────
 | Prometheus metrics | `nts_*` metrics for ingestion, tier usage, KV/Object ops, latency |
 | Health checks | Liveness (`/healthz`) and readiness (`/readyz`) endpoints |
 | Management CLI | `nts-ctl` for inspecting streams, blocks, KV keys, and objects |
+| WorkQueue auto-mirror | Automatically creates a Limits-retention mirror for WorkQueue streams with existing consumers |
 | Multi-stream | Configure independent policies per JetStream stream |
 | Graceful shutdown | Flushes partial blocks on SIGINT/SIGTERM |
 
@@ -274,13 +288,14 @@ Stream types are auto-detected from the name prefix (`KV_` → kv, `OBJ_` → ob
 
 | Setting | Default | Description |
 |---|---|---|
+| `streams[].auto_mirror` | `true` | Auto-create Limits mirror for WorkQueue streams with existing consumers |
 | `block.target_size` | `8MB` | Target block size before sealing |
 | `block.max_linger` | `30s` | Max time to wait before sealing a partial block |
 | `block.compression` | `s2` | Compression algorithm (`none`, `s2`) |
 | `policy.eval_interval` | `30s` | How often to evaluate demotion policies |
-| `tiers.memory.max_age` | — | Demote memory blocks older than this |
-| `tiers.memory.max_bytes` | — | Demote oldest memory blocks when total exceeds this |
-| `tiers.file.max_age` | — | Demote file blocks older than this |
+| `tiers.memory.max_age` | — | Evict memory blocks older than this |
+| `tiers.memory.max_bytes` | — | Evict oldest memory blocks when total exceeds this |
+| `tiers.file.max_age` | — | Evict file blocks older than this |
 | `tiers.blob.storage_class` | `STANDARD` | S3 storage class (`STANDARD`, `STANDARD_IA`, `GLACIER`) |
 
 ## Using with an Existing JetStream Environment
@@ -335,10 +350,10 @@ api:
 # Binary
 bin/nats-tiered-storage -config /path/to/config.yaml
 
-# Docker
+# Docker (GHCR)
 docker run -v /path/to/config.yaml:/etc/nts/config.yaml \
            -v /var/lib/nts:/var/lib/nts \
-           nats-tiered-storage
+           ghcr.io/gftdcojp/nats-tiered-storage:0.3.0
 
 # Kubernetes
 kubectl apply -f deploy/kubernetes/configmap.yaml
@@ -368,14 +383,28 @@ kubectl apply -f deploy/kubernetes/sidecar-deployment.yaml
 - Messages remain in JetStream after the sidecar ACKs them — the sidecar's consumer is independent
 - You can safely set `max_age` or `max_bytes` on JetStream to limit retention; the sidecar archives messages before they expire
 
+#### WorkQueue streams
+
+JetStream [WorkQueue retention](https://docs.nats.io/nats-concepts/jetstream/streams#retention-policies) streams only allow a single filter-less consumer. If the target stream uses WorkQueue retention and already has a consumer, the sidecar **automatically creates a Limits-retention mirror** (`NTS_MIRROR_{stream}`) and consumes from it instead. This is fully transparent — metadata and blocks still use the original stream name.
+
+Auto-mirroring is enabled by default and can be disabled per stream:
+
+```yaml
+streams:
+  - name: "TASKS"
+    consumer_name: "nts-archiver"
+    auto_mirror: false   # disable auto-mirror for this stream
+```
+
 ### Typical use case
 
 ```
 JetStream:  max_age=7d  (messages deleted after 7 days)
-Sidecar:    archives on ingest → Memory 5m → File 24h → S3 forever
+Sidecar:    write-through ingest → all enabled tiers at once
+            eviction: Memory 5m → File 24h → S3 forever
 
 Result: Hot data served from JetStream (fast),
-        cold data served from sidecar (transparent fallback)
+        cold data served from sidecar (fallthrough reads)
 ```
 
 ## HTTP API
@@ -391,8 +420,8 @@ Result: Hot data served from JetStream (fast),
 | `GET` | `/v1/messages/{stream}?start=N&count=M` | Retrieve a range of messages |
 | `GET` | `/v1/blocks/{stream}` | List all blocks for a stream |
 | `GET` | `/v1/blocks/{stream}/{blockID}` | Get block metadata |
-| `POST` | `/v1/admin/demote/{stream}/{blockID}` | Demote a block to the next colder tier |
-| `POST` | `/v1/admin/promote/{stream}/{blockID}` | Promote a block to the next hotter tier |
+| `POST` | `/v1/admin/demote/{stream}/{blockID}` | Evict a block from its hottest tier |
+| `POST` | `/v1/admin/promote/{stream}/{blockID}` | Copy a block into the next hotter tier |
 
 ### KV Store APIs
 
@@ -424,34 +453,43 @@ Result: Hot data served from JetStream (fast),
 
 ## Data Flow
 
-### Ingest (write path)
+### Ingest (write-through)
 
 ```
 nats-server JetStream
   → Pull Consumer (fetch batch)
     → Block Builder (accumulate to ~8MB or linger timeout)
-      → Seal Block → Tier Controller.Ingest() → Memory Tier
-        → Metadata Store.RecordBlock()
+      → Seal Block → Tier Controller.Ingest()
+          → Write to Memory (if enabled)
+          → Write to File   (if enabled)
+          → Write to Blob   (if enabled)
+        → Metadata Store.RecordBlock(tiers=[Memory,File,Blob])
           → ACK batch
 ```
 
-### Demotion (automatic)
+All enabled tiers receive the block simultaneously. ACK only after all writes succeed.
+
+### Eviction (automatic)
 
 ```
-Memory [age > 5m / max_bytes exceeded] → File Tier
-File   [age > 24h / max_bytes exceeded] → Blob Tier (S3)
+Memory [age > 5m / max_bytes exceeded] → evict from Memory (data remains in File + Blob)
+File   [age > 24h / max_bytes exceeded] → evict from File (data remains in Blob)
+Blob   [max_age exceeded] → delete from all tiers (permanent expiry)
 ```
 
-Order: write to destination → update metadata → delete from source (crash-safe).
+Eviction only deletes from the hottest tier — no data copy needed (already in colder tiers via write-through).
 
-### Retrieval (read path)
+### Retrieval (fallthrough reads)
 
 ```
-Request → Metadata Lookup → Tier routing
-  → Memory hit  → return immediately
-  → File hit    → return + async promote to memory
-  → Blob hit    → S3 Range Request → return + async promote to file
+Request → Metadata Lookup → Fallthrough tiers (hot → cold)
+  → Try Memory  → hit? return
+  → Try File    → hit? return
+  → Try Blob    → hit? return (S3 Range Request)
+  → All miss    → error
 ```
+
+If Memory has evicted a block (LRU), the read automatically falls through to the next tier.
 
 ## Observability
 
@@ -475,6 +513,7 @@ Key metrics (prefix `nts_`):
 | `nts_obj_index_ops_total` | Counter | Object Store index operations |
 | `nts_obj_get_requests_total` | Counter | Object Store sidecar get requests |
 | `nts_obj_reassembly_duration_seconds` | Histogram | Object chunk reassembly time |
+| `nts_mirror_streams_created_total` | Counter | Auto-created mirror streams for WorkQueue conflict avoidance |
 
 ### Health Checks
 
@@ -483,7 +522,7 @@ Key metrics (prefix `nts_`):
 
 ## Testing
 
-149 tests covering all packages with race detection.
+156+ tests covering all packages with race detection (plus stress tests behind build tags).
 
 ```bash
 # All tests
@@ -509,7 +548,7 @@ go tool cover -func=coverage.out
 | Memory store | 8 | LRU eviction, MaxBlocks, concurrent access |
 | File store | 15 | Put/Get, index lookup, corruption fallback, durability |
 | Blob store | 12 | S3 mock, range requests, cache, concurrent race detection |
-| Tier controller | 17 | Ingest, demote, promote, retrieve, policy cycles, concurrency |
+| Tier controller | 21 | Write-through ingest, eviction, fallthrough reads, promote, policy cycles, concurrency |
 | Lifecycle/GC | 6 | Expiry, retention, partial failure, cancel |
 | HTTP handlers | 12 | Status, blocks, messages, KV, Object Store, errors |
 | Health/Metrics | 7 | Liveness, readiness, NATS/meta checks, Prometheus metrics |
@@ -517,7 +556,8 @@ go tool cover -func=coverage.out
 | Integration | 3 | Full pipeline, KV Store, Object Store (end-to-end) |
 | Durability | 7 | BoltDB restart, file restart, CRC, tier transitions, KV/Obj persistence |
 | Stress | 6 | 10K msg ingest, 50-goroutine concurrency, rapid tier migration, 50K msg blocks |
-| Config | 4 | YAML parsing, validation, byte sizes |
+| Mirror | 7 | WorkQueue auto-mirror resolution, naming, idempotency |
+| Config | 7 | YAML parsing, validation, byte sizes, auto-mirror, tier retention |
 
 ## Project Structure
 
@@ -530,7 +570,7 @@ go tool cover -func=coverage.out
 │   ├── blob/                   # S3-compatible blob tier store
 │   ├── config/                 # YAML config parsing, stream type detection
 │   ├── file/                   # Local file tier store
-│   ├── ingest/                 # JetStream consumer, pipeline, KV/Obj classifiers
+│   ├── ingest/                 # JetStream consumer, pipeline, WorkQueue mirror, KV/Obj classifiers
 │   ├── lifecycle/              # Retention enforcement and GC
 │   ├── memory/                 # In-process LRU memory tier store
 │   ├── meta/                   # BoltDB metadata (blocks, KV index, Obj index)

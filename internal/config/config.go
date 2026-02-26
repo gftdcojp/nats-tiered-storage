@@ -48,11 +48,21 @@ type StreamConfig struct {
 	Type         StreamType       `yaml:"type"`
 	Subjects     []string         `yaml:"subjects"`
 	ConsumerName string           `yaml:"consumer_name"`
+	AutoMirror   *bool            `yaml:"auto_mirror"`
 	FetchBatch   int              `yaml:"fetch_batch"`
 	FetchTimeout Duration         `yaml:"fetch_timeout"`
 	Tiers        TiersConfig      `yaml:"tiers"`
 	KV           KVArchiveConfig  `yaml:"kv"`
 	ObjectStore  ObjArchiveConfig `yaml:"objectstore"`
+}
+
+// AutoMirrorEnabled returns whether auto-mirroring is enabled for this stream.
+// Defaults to true when not explicitly set.
+func (sc *StreamConfig) AutoMirrorEnabled() bool {
+	if sc.AutoMirror == nil {
+		return true
+	}
+	return *sc.AutoMirror
 }
 
 type KVArchiveConfig struct {
@@ -109,6 +119,25 @@ type TiersConfig struct {
 	Memory MemoryTierConfig `yaml:"memory"`
 	File   FileTierConfig   `yaml:"file"`
 	Blob   BlobTierConfig   `yaml:"blob"`
+}
+
+// MaxTierRetention returns the maximum retention duration across all enabled tiers.
+// If no tier has a configured max_age, the provided defaultAge is returned.
+func (tc *TiersConfig) MaxTierRetention(defaultAge time.Duration) time.Duration {
+	var max time.Duration
+	if tc.Memory.Enabled && tc.Memory.MaxAge.Duration() > max {
+		max = tc.Memory.MaxAge.Duration()
+	}
+	if tc.File.Enabled && tc.File.MaxAge.Duration() > max {
+		max = tc.File.MaxAge.Duration()
+	}
+	if tc.Blob.Enabled && tc.Blob.MaxAge.Duration() > max {
+		max = tc.Blob.MaxAge.Duration()
+	}
+	if max == 0 {
+		return defaultAge
+	}
+	return max
 }
 
 type MemoryTierConfig struct {

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func TestLoadAndValidate(t *testing.T) {
@@ -93,4 +94,95 @@ func TestParseByteSizes(t *testing.T) {
 			t.Errorf("parseByteSize(%q) = %d, want %d", tt.input, result, tt.expected)
 		}
 	}
+}
+
+func TestAutoMirrorDefault(t *testing.T) {
+	sc := StreamConfig{Name: "ORDERS"}
+	if !sc.AutoMirrorEnabled() {
+		t.Error("AutoMirrorEnabled() should be true by default (nil)")
+	}
+
+	enabled := true
+	sc.AutoMirror = &enabled
+	if !sc.AutoMirrorEnabled() {
+		t.Error("AutoMirrorEnabled() should be true when explicitly set to true")
+	}
+}
+
+func TestAutoMirrorExplicitFalse(t *testing.T) {
+	disabled := false
+	sc := StreamConfig{
+		Name:       "ORDERS",
+		AutoMirror: &disabled,
+	}
+	if sc.AutoMirrorEnabled() {
+		t.Error("AutoMirrorEnabled() should be false when explicitly set to false")
+	}
+}
+
+func TestMaxTierRetention(t *testing.T) {
+	defaultAge := 72 * time.Hour
+
+	t.Run("no tiers enabled", func(t *testing.T) {
+		tc := TiersConfig{}
+		got := tc.MaxTierRetention(defaultAge)
+		if got != defaultAge {
+			t.Errorf("MaxTierRetention = %v, want default %v", got, defaultAge)
+		}
+	})
+
+	t.Run("memory only", func(t *testing.T) {
+		tc := TiersConfig{
+			Memory: MemoryTierConfig{Enabled: true, MaxAge: Duration(5 * time.Minute)},
+		}
+		got := tc.MaxTierRetention(defaultAge)
+		if got != 5*time.Minute {
+			t.Errorf("MaxTierRetention = %v, want 5m", got)
+		}
+	})
+
+	t.Run("file is largest", func(t *testing.T) {
+		tc := TiersConfig{
+			Memory: MemoryTierConfig{Enabled: true, MaxAge: Duration(5 * time.Minute)},
+			File:   FileTierConfig{Enabled: true, MaxAge: Duration(24 * time.Hour)},
+		}
+		got := tc.MaxTierRetention(defaultAge)
+		if got != 24*time.Hour {
+			t.Errorf("MaxTierRetention = %v, want 24h", got)
+		}
+	})
+
+	t.Run("blob is largest", func(t *testing.T) {
+		tc := TiersConfig{
+			Memory: MemoryTierConfig{Enabled: true, MaxAge: Duration(5 * time.Minute)},
+			File:   FileTierConfig{Enabled: true, MaxAge: Duration(24 * time.Hour)},
+			Blob:   BlobTierConfig{Enabled: true, MaxAge: Duration(720 * time.Hour)},
+		}
+		got := tc.MaxTierRetention(defaultAge)
+		if got != 720*time.Hour {
+			t.Errorf("MaxTierRetention = %v, want 720h", got)
+		}
+	})
+
+	t.Run("enabled but zero max_age falls back to default", func(t *testing.T) {
+		tc := TiersConfig{
+			Memory: MemoryTierConfig{Enabled: true},
+			File:   FileTierConfig{Enabled: true},
+		}
+		got := tc.MaxTierRetention(defaultAge)
+		if got != defaultAge {
+			t.Errorf("MaxTierRetention = %v, want default %v", got, defaultAge)
+		}
+	})
+
+	t.Run("disabled tier ignored", func(t *testing.T) {
+		tc := TiersConfig{
+			Memory: MemoryTierConfig{Enabled: true, MaxAge: Duration(5 * time.Minute)},
+			File:   FileTierConfig{Enabled: false, MaxAge: Duration(999 * time.Hour)},
+		}
+		got := tc.MaxTierRetention(defaultAge)
+		if got != 5*time.Minute {
+			t.Errorf("MaxTierRetention = %v, want 5m (disabled file tier should be ignored)", got)
+		}
+	})
 }

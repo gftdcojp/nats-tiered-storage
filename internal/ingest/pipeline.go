@@ -29,17 +29,19 @@ type PipelineConfig struct {
 
 // Pipeline manages the ingestion of messages from a JetStream stream.
 type Pipeline struct {
-	js          jetstream.JetStream
-	ctrl        *tier.Controller
-	meta        meta.Store
-	streamCfg   config.StreamConfig
-	blockCfg    config.BlockConfig
-	logger      *zap.Logger
-	builder     *block.Builder
-	lingerTimer *time.Timer
-	pendingAcks []jetstream.Msg
-	mu          sync.Mutex
-	nextID      atomic.Uint64
+	js            jetstream.JetStream
+	ctrl          *tier.Controller
+	meta          meta.Store
+	streamCfg     config.StreamConfig
+	blockCfg      config.BlockConfig
+	logger        *zap.Logger
+	builder       *block.Builder
+	lingerTimer   *time.Timer
+	pendingAcks   []jetstream.Msg
+	mu            sync.Mutex
+	nextID        atomic.Uint64
+	consumeStream string // stream to create consumer on (may be mirror)
+	isMirror      bool   // true when consuming from an auto-created mirror
 }
 
 // NewPipeline creates a new ingest pipeline.
@@ -64,6 +66,14 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		p.logger.Info("resuming from last acked sequence", zap.Uint64("seq", lastSeq))
 	}
 
+	// Resolve which stream to consume from (may create a mirror for WorkQueue streams).
+	res, err := resolveConsumerStream(ctx, p.js, p.streamCfg, p.logger)
+	if err != nil {
+		return fmt.Errorf("resolving consumer stream for %s: %w", p.streamCfg.Name, err)
+	}
+	p.consumeStream = res.ConsumeStream
+	p.isMirror = res.IsMirror
+
 	// Create or get durable pull consumer
 	consumerCfg := jetstream.ConsumerConfig{
 		Durable:       p.streamCfg.ConsumerName,
@@ -71,17 +81,21 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		DeliverPolicy: jetstream.DeliverAllPolicy,
 		MaxAckPending: p.streamCfg.FetchBatch * 4,
 	}
-	if len(p.streamCfg.Subjects) > 0 {
+	// Only set FilterSubjects when consuming from the original stream.
+	// Mirror streams replicate all messages, so filtering is unnecessary.
+	if !p.isMirror && len(p.streamCfg.Subjects) > 0 {
 		consumerCfg.FilterSubjects = p.streamCfg.Subjects
 	}
 
-	cons, err := p.js.CreateOrUpdateConsumer(ctx, p.streamCfg.Name, consumerCfg)
+	cons, err := p.js.CreateOrUpdateConsumer(ctx, p.consumeStream, consumerCfg)
 	if err != nil {
-		return fmt.Errorf("creating consumer %s on stream %s: %w", p.streamCfg.ConsumerName, p.streamCfg.Name, err)
+		return fmt.Errorf("creating consumer %s on stream %s: %w", p.streamCfg.ConsumerName, p.consumeStream, err)
 	}
 
 	p.logger.Info("ingest pipeline started",
 		zap.String("stream", p.streamCfg.Name),
+		zap.String("consume_stream", p.consumeStream),
+		zap.Bool("is_mirror", p.isMirror),
 		zap.String("consumer", p.streamCfg.ConsumerName),
 		zap.Int("fetch_batch", p.streamCfg.FetchBatch),
 	)

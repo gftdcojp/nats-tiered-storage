@@ -113,6 +113,12 @@ var (
 		Help:    "Time to reassemble object chunks",
 		Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1, 5, 10},
 	}, []string{"bucket"})
+
+	// Mirror metrics
+	MirrorStreamsCreated = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "nts_mirror_streams_created_total",
+		Help: "Total mirror streams created for WorkQueue consumer conflict avoidance",
+	}, []string{"stream"})
 )
 
 // RunServer starts the Prometheus metrics HTTP server.

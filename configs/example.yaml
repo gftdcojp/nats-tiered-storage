@@ -19,6 +19,9 @@ streams:
     # type: "stream"   # auto-detected (no KV_/OBJ_ prefix)
     # subjects: ["orders.>"]
     consumer_name: "nts-archiver"
+    # auto_mirror: true  # (default: true) Automatically create a Limits-retention
+                          # mirror when the source stream uses WorkQueue retention and
+                          # already has consumers. Set to false to disable.
     fetch_batch: 256
     fetch_timeout: "5s"
 

@@ -24,11 +24,12 @@ docker:
 	docker build --build-arg VERSION=$(VERSION) -t nats-tiered-storage:$(VERSION) -f deploy/docker/Dockerfile .
 
 .PHONY: docker-ghcr
-docker-ghcr: docker
-	docker tag nats-tiered-storage:$(VERSION) $(GHCR_IMAGE):$(VERSION)
-	docker tag nats-tiered-storage:$(VERSION) $(GHCR_IMAGE):latest
-	docker push $(GHCR_IMAGE):$(VERSION)
-	docker push $(GHCR_IMAGE):latest
+docker-ghcr:
+	docker buildx build --platform linux/amd64,linux/arm64 \
+		--build-arg VERSION=$(VERSION) \
+		-t $(GHCR_IMAGE):$(VERSION) \
+		-t $(GHCR_IMAGE):latest \
+		-f deploy/docker/Dockerfile --push .
 
 .PHONY: dev
 dev:

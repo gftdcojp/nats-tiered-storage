@@ -57,6 +57,8 @@ make build
 
 ### Docker (GHCR)
 
+Multi-arch images (linux/amd64, linux/arm64) are published to GHCR:
+
 ```bash
 docker pull ghcr.io/gftdcojp/nats-tiered-storage:0.3.0
 docker run -v /path/to/config.yaml:/etc/nts/config.yaml \

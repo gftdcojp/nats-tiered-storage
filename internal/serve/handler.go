@@ -11,6 +11,7 @@ import (
 	"github.com/gftdcojp/nats-tiered-storage/internal/config"
 	"github.com/gftdcojp/nats-tiered-storage/internal/ingest"
 	"github.com/gftdcojp/nats-tiered-storage/internal/meta"
+	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 )
 
@@ -18,11 +19,12 @@ type handler struct {
 	pipelines  map[string]*ingest.Pipeline
 	meta       meta.Store
 	streamCfgs []config.StreamConfig
+	js         jetstream.JetStream
 	logger     *zap.Logger
 }
 
 // RunHTTP starts the HTTP API server.
-func RunHTTP(ctx context.Context, cfg config.APIConfig, pipelines []*ingest.Pipeline, streamCfgs []config.StreamConfig, metaStore meta.Store, logger *zap.Logger) error {
+func RunHTTP(ctx context.Context, cfg config.APIConfig, pipelines []*ingest.Pipeline, streamCfgs []config.StreamConfig, metaStore meta.Store, js jetstream.JetStream, logger *zap.Logger) error {
 	pipeMap := make(map[string]*ingest.Pipeline)
 	for _, p := range pipelines {
 		pipeMap[p.Stream()] = p
@@ -32,6 +34,7 @@ func RunHTTP(ctx context.Context, cfg config.APIConfig, pipelines []*ingest.Pipe
 		pipelines:  pipeMap,
 		meta:       metaStore,
 		streamCfgs: streamCfgs,
+		js:         js,
 		logger:     logger,
 	}
 

@@ -144,7 +144,7 @@ func run(cfg *config.Config, logger *zap.Logger) error {
 	// Start HTTP API
 	if cfg.API.Enabled {
 		g.Go(func() error {
-			return serve.RunHTTP(gctx, cfg.API, pipelines, cfg.Streams, metaStore, logger.Named("api"))
+			return serve.RunHTTP(gctx, cfg.API, pipelines, cfg.Streams, metaStore, js, logger.Named("api"))
 		})
 	}
 
@@ -155,7 +155,7 @@ func run(cfg *config.Config, logger *zap.Logger) error {
 			return serve.RunNATSResponder(gctx, nc, cfg.API.NATSResponder, pipelines, metaStore, logger.Named("nats-responder"))
 		})
 		g.Go(func() error {
-			return serve.RunNATSKVResponder(gctx, nc, prefix, cfg.Streams, pipelines, metaStore, logger.Named("nats-kv-responder"))
+			return serve.RunNATSKVResponder(gctx, nc, js, prefix, cfg.Streams, pipelines, metaStore, logger.Named("nats-kv-responder"))
 		})
 		g.Go(func() error {
 			return serve.RunNATSObjResponder(gctx, nc, prefix, cfg.Streams, pipelines, metaStore, logger.Named("nats-obj-responder"))

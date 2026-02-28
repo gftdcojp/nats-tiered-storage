@@ -9,6 +9,7 @@ func (h *handler) registerKVRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/kv/{bucket}/get/{key...}", h.handleKVGet)
 	mux.HandleFunc("GET /v1/kv/{bucket}/history/{key...}", h.handleKVHistory)
 	mux.HandleFunc("GET /v1/kv/{bucket}/keys", h.handleKVListKeys)
+	mux.HandleFunc("POST /v1/kv/{bucket}/restore/{key...}", h.handleKVRestore)
 }
 
 func (h *handler) handleKVGet(w http.ResponseWriter, r *http.Request) {
@@ -101,4 +102,50 @@ func (h *handler) handleKVListKeys(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, keys)
+}
+
+func (h *handler) handleKVRestore(w http.ResponseWriter, r *http.Request) {
+	bucket := r.PathValue("bucket")
+	key := r.PathValue("key")
+
+	stream, p := h.resolveKVBucket(bucket)
+	if p == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "KV bucket not found"})
+		return
+	}
+
+	entry, err := h.meta.LookupKVKey(r.Context(), stream, key)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if entry.Operation == "DEL" || entry.Operation == "PURGE" {
+		writeJSON(w, http.StatusGone, map[string]string{"error": "key was deleted"})
+		return
+	}
+
+	stored, err := p.Controller().Retrieve(r.Context(), entry.LastSequence)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	kv, err := h.js.KeyValue(r.Context(), bucket)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "opening KV: " + err.Error()})
+		return
+	}
+
+	rev, err := kv.Put(r.Context(), key, stored.Data)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "restoring to hot tier: " + err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"bucket":   bucket,
+		"key":      key,
+		"revision": rev,
+		"restored": true,
+	})
 }

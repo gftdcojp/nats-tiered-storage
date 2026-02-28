@@ -524,7 +524,7 @@ func TestIntegration_KVStore(t *testing.T) {
 	respCtx, respCancel := context.WithCancel(ctx)
 	respDone := make(chan error, 1)
 	go func() {
-		respDone <- serve.RunNATSKVResponder(respCtx, nc, "nts", []config.StreamConfig{streamCfg}, []*ingest.Pipeline{pipeline}, metaStore, logger)
+		respDone <- serve.RunNATSKVResponder(respCtx, nc, js, "nts", []config.StreamConfig{streamCfg}, []*ingest.Pipeline{pipeline}, metaStore, logger)
 	}()
 	time.Sleep(500 * time.Millisecond) // wait for subscription
 

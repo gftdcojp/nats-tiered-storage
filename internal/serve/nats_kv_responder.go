@@ -10,6 +10,7 @@ import (
 	"github.com/gftdcojp/nats-tiered-storage/internal/ingest"
 	"github.com/gftdcojp/nats-tiered-storage/internal/meta"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 )
 
@@ -18,7 +19,8 @@ import (
 //   - nts.kv.{bucket}.get.{key}       — get latest value
 //   - nts.kv.{bucket}.history.{key}   — get all revisions
 //   - nts.kv.{bucket}.keys            — list keys
-func RunNATSKVResponder(ctx context.Context, nc *nats.Conn, prefix string, streamCfgs []config.StreamConfig, pipelines []*ingest.Pipeline, metaStore meta.Store, logger *zap.Logger) error {
+//   - nts.kv.{bucket}.restore.{key}   — restore evicted key to hot tier
+func RunNATSKVResponder(ctx context.Context, nc *nats.Conn, js jetstream.JetStream, prefix string, streamCfgs []config.StreamConfig, pipelines []*ingest.Pipeline, metaStore meta.Store, logger *zap.Logger) error {
 	if prefix == "" {
 		prefix = "nts"
 	}
@@ -84,6 +86,14 @@ func RunNATSKVResponder(ctx context.Context, nc *nats.Conn, prefix string, strea
 				kvPrefix = strings.Join(parts[4:], ".")
 			}
 			handleKVKeys(ctx, msg, metaStore, ks.streamName, kvPrefix)
+
+		case "restore":
+			if len(parts) < 5 {
+				msg.Respond(errorJSON("missing key"))
+				return
+			}
+			key := strings.Join(parts[4:], ".")
+			handleKVRestore(ctx, msg, nc, js, metaStore, ks.streamName, ks.pipeline, bucket, key)
 
 		default:
 			msg.Respond(errorJSON(fmt.Sprintf("unknown KV operation %q", op)))
@@ -166,6 +176,44 @@ func handleKVKeys(ctx context.Context, msg *nats.Msg, store meta.Store, stream, 
 	}
 
 	resp, _ := json.Marshal(keys)
+	msg.Respond(resp)
+}
+
+func handleKVRestore(ctx context.Context, msg *nats.Msg, nc *nats.Conn,
+	js jetstream.JetStream, store meta.Store,
+	stream string, p *ingest.Pipeline, bucket, key string) {
+
+	entry, err := store.LookupKVKey(ctx, stream, key)
+	if err != nil {
+		msg.Respond(errorJSON(err.Error()))
+		return
+	}
+	if entry.Operation == "DEL" || entry.Operation == "PURGE" {
+		msg.Respond(errorJSON("key was deleted"))
+		return
+	}
+
+	stored, err := p.Controller().Retrieve(ctx, entry.LastSequence)
+	if err != nil {
+		msg.Respond(errorJSON("retrieve: " + err.Error()))
+		return
+	}
+
+	kv, err := js.KeyValue(ctx, bucket)
+	if err != nil {
+		msg.Respond(errorJSON("open kv: " + err.Error()))
+		return
+	}
+
+	rev, err := kv.Put(ctx, key, stored.Data)
+	if err != nil {
+		msg.Respond(errorJSON("put: " + err.Error()))
+		return
+	}
+
+	resp, _ := json.Marshal(map[string]interface{}{
+		"bucket": bucket, "key": key, "revision": rev, "restored": true,
+	})
 	msg.Respond(resp)
 }
 

@@ -24,14 +24,20 @@ type Config struct {
 
 	// Timeout for sidecar requests. Defaults to 5s.
 	Timeout time.Duration
+
+	// AutoRestore, if true, causes KVStore.Get to restore evicted keys back to
+	// the hot NATS KV tier after a successful cold fetch. Defaults to false for
+	// backward compatibility.
+	AutoRestore bool
 }
 
 // Client provides transparent access to NATS data with cold storage fallback.
 type Client struct {
-	nc      *nats.Conn
-	js      jetstream.JetStream
-	prefix  string
-	timeout time.Duration
+	nc          *nats.Conn
+	js          jetstream.JetStream
+	prefix      string
+	timeout     time.Duration
+	autoRestore bool
 }
 
 // New creates a new NTS transparent client.
@@ -51,10 +57,11 @@ func New(cfg Config) (*Client, error) {
 		timeout = 5 * time.Second
 	}
 	return &Client{
-		nc:      cfg.NC,
-		js:      cfg.JS,
-		prefix:  prefix,
-		timeout: timeout,
+		nc:          cfg.NC,
+		js:          cfg.JS,
+		prefix:      prefix,
+		timeout:     timeout,
+		autoRestore: cfg.AutoRestore,
 	}, nil
 }
 
@@ -65,11 +72,12 @@ func (c *Client) KeyValue(ctx context.Context, bucket string) (*KVStore, error) 
 		return nil, fmt.Errorf("nts: opening KV bucket %q: %w", bucket, err)
 	}
 	return &KVStore{
-		kv:      kv,
-		bucket:  bucket,
-		nc:      c.nc,
-		prefix:  c.prefix,
-		timeout: c.timeout,
+		kv:          kv,
+		bucket:      bucket,
+		nc:          c.nc,
+		prefix:      c.prefix,
+		timeout:     c.timeout,
+		autoRestore: c.autoRestore,
 	}, nil
 }
 

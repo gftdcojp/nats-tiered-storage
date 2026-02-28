@@ -80,6 +80,7 @@ Commands:
   kv get <bucket> <key>         Get a KV value from cold storage
   kv keys <bucket> [prefix]     List KV keys in cold storage
   kv history <bucket> <key>     Show key revision history
+  kv restore <bucket> <key>     Restore a KV key from cold storage back to hot tier
   obj get <bucket> <name>       Get an object from cold storage (to stdout)
   obj info <bucket> <name>      Show object metadata
   obj list <bucket>             List objects in cold storage
@@ -178,7 +179,7 @@ func cmdPromote(addr, stream, blockID string) {
 
 func cmdKV(addr string, args []string) {
 	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: nts-ctl kv <get|keys|history> <bucket> [key|prefix]")
+		fmt.Fprintln(os.Stderr, "usage: nts-ctl kv <get|keys|history|restore> <bucket> [key|prefix]")
 		os.Exit(1)
 	}
 	op := args[0]
@@ -225,6 +226,19 @@ func cmdKV(addr string, args []string) {
 			os.Exit(1)
 		}
 		resp, err := http.Get(addr + "/v1/kv/" + bucket + "/history/" + args[2])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		printJSON(resp.Body)
+
+	case "restore":
+		if len(args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: nts-ctl kv restore <bucket> <key>")
+			os.Exit(1)
+		}
+		resp, err := http.Post(addr+"/v1/kv/"+bucket+"/restore/"+args[2], "", nil)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)

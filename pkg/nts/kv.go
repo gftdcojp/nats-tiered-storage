@@ -12,11 +12,12 @@ import (
 
 // KVStore wraps jetstream.KeyValue with transparent cold storage fallback.
 type KVStore struct {
-	kv      jetstream.KeyValue
-	bucket  string
-	nc      *nats.Conn
-	prefix  string
-	timeout time.Duration
+	kv          jetstream.KeyValue
+	bucket      string
+	nc          *nats.Conn
+	prefix      string
+	timeout     time.Duration
+	autoRestore bool
 }
 
 // Get retrieves the latest value for a key.
@@ -45,12 +46,19 @@ func (s *KVStore) Get(ctx context.Context, key string) (jetstream.KeyValueEntry,
 		return nil, fmt.Errorf("nts: sidecar: %s", result.Error)
 	}
 
+	op := parseKVOp(result.Operation)
+	if s.autoRestore && op == jetstream.KeyValuePut {
+		// Best-effort: silently restore the evicted key to the hot JetStream KV
+		// tier so subsequent reads are served locally. Errors are intentionally
+		// swallowed — the caller already has the value from cold storage.
+		_, _ = s.kv.Put(ctx, key, []byte(result.Value))
+	}
 	return &kvEntry{
 		bucket:    result.Bucket,
 		key:       result.Key,
 		value:     []byte(result.Value),
 		revision:  result.Revision,
-		operation: parseKVOp(result.Operation),
+		operation: op,
 		timestamp: result.Timestamp,
 	}, nil
 }

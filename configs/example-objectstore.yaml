@@ -1,0 +1,81 @@
+# Object Store archival configuration
+#
+# Archives NATS JetStream Object Store buckets to 3-tier storage.
+# Objects stored via jetstream.ObjectStore are automatically ingested,
+# chunked, and written to all enabled tiers (write-through).
+#
+# Read-through: the nts NATS responder serves cold objects transparently.
+# Clients use nts.obj.{bucket}.get.{name} for NATS request-reply,
+# or GET /v1/objects/{bucket}/get/{name} for HTTP streaming.
+#
+# Example: document preview images (WebP) with 1GB hot tier and
+# cold archival to S3-compatible blob storage (e.g., Backblaze B2).
+
+nats:
+  url: "nats://nats.wasmcloud-system.svc.cluster.local:4222"
+  connection_name: "nats-tiered-storage"
+  max_reconnects: -1
+  reconnect_wait: "2s"
+
+streams:
+  - name: "OBJ_gftd-preview"
+    # type: "objectstore"  # auto-detected from OBJ_ prefix
+    consumer_name: "nts-archiver-obj-gftd-preview"
+    fetch_batch: 64
+    fetch_timeout: "5s"
+    # objectstore:
+    #   bucket_name: "gftd-preview"  # auto-derived: strip OBJ_ prefix
+
+    tiers:
+      memory:
+        enabled: true
+        max_bytes: "256MB"
+        max_blocks: 32
+        max_age: "5m"
+
+      file:
+        enabled: true
+        data_dir: "/data/file-tier"
+        max_bytes: "10GB"
+        max_blocks: 1280
+        max_age: "48h"
+
+      blob:
+        enabled: true
+        endpoint: "https://s3.us-west-004.backblazeb2.com"
+        region: "us-west-004"
+        bucket: "nats-tiered-archive"
+        prefix: "prod"
+        force_path_style: true
+        storage_class: "STANDARD"
+        max_age: "0"         # retain forever in cold storage
+        multipart: true
+
+block:
+  target_size: "8MB"
+  max_linger: "30s"          # seal partial blocks after 30s
+  compression: "s2"
+
+policy:
+  eval_interval: "30s"
+
+metadata:
+  path: "/data/meta.db"
+
+api:
+  enabled: true
+  listen: ":8080"
+  nats_responder:
+    enabled: true
+    subject_prefix: "nts"    # nts.obj.gftd-preview.get.{name}
+
+observability:
+  metrics:
+    enabled: true
+    listen: ":9090"
+  health:
+    enabled: true
+    listen: ":8081"
+  logging:
+    level: "info"
+    format: "json"

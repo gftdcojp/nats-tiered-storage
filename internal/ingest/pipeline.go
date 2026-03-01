@@ -21,6 +21,9 @@ import (
 // calcBackoff returns the backoff duration for the n-th consecutive error
 // (1-based). The delay doubles with each error up to max, with up to 25%
 // random jitter added to spread retries across streams.
+//
+// At the max cap, jitter is applied as max * [0.75, 1.0) so that streams
+// capped at the same max still have spread and avoid thundering-herd.
 func calcBackoff(n int, initial, max time.Duration) time.Duration {
 	if n <= 0 || initial <= 0 {
 		return 0
@@ -33,13 +36,11 @@ func calcBackoff(n int, initial, max time.Duration) time.Duration {
 			break
 		}
 	}
-	// Add up to 25% jitter to avoid thundering-herd across streams.
-	// rand.Int63n uses a locked global source (safe for concurrent goroutines, Go ≥ 1.20).
+	// Apply jitter: subtract up to 25% from the computed delay.
+	// This keeps the delay in [base*0.75, base) which naturally stays ≤ max
+	// even when delay == max, avoiding the thundering-herd at the cap.
 	if jitterRange := int64(delay / 4); jitterRange > 0 {
-		delay += time.Duration(rand.Int63n(jitterRange))
-	}
-	if delay > max {
-		delay = max
+		delay -= time.Duration(rand.Int63n(jitterRange))
 	}
 	return delay
 }

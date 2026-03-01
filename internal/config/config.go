@@ -43,6 +43,16 @@ const (
 	StreamTypeObjectStore StreamType = "objectstore"
 )
 
+// FetchRetryConfig controls exponential backoff behaviour when JetStream fetch
+// requests fail (e.g. "no responders available for request").
+type FetchRetryConfig struct {
+	// InitialDelay is the backoff duration after the first consecutive error.
+	// Subsequent delays double up to MaxDelay. Defaults to 1s.
+	InitialDelay Duration `yaml:"initial_delay"`
+	// MaxDelay caps the exponential backoff. Defaults to 60s.
+	MaxDelay Duration `yaml:"max_delay"`
+}
+
 type StreamConfig struct {
 	Name         string           `yaml:"name"`
 	Type         StreamType       `yaml:"type"`
@@ -51,6 +61,7 @@ type StreamConfig struct {
 	AutoMirror   *bool            `yaml:"auto_mirror"`
 	FetchBatch   int              `yaml:"fetch_batch"`
 	FetchTimeout Duration         `yaml:"fetch_timeout"`
+	Retry        FetchRetryConfig `yaml:"retry"`
 	Tiers        TiersConfig      `yaml:"tiers"`
 	KV           KVArchiveConfig  `yaml:"kv"`
 	ObjectStore  ObjArchiveConfig `yaml:"objectstore"`

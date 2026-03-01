@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +18,32 @@ import (
 	"go.uber.org/zap"
 )
 
+// calcBackoff returns the backoff duration for the n-th consecutive error
+// (1-based). The delay doubles with each error up to max, with up to 25%
+// random jitter added to spread retries across streams.
+func calcBackoff(n int, initial, max time.Duration) time.Duration {
+	if n <= 0 || initial <= 0 {
+		return 0
+	}
+	delay := initial
+	for i := 1; i < n; i++ {
+		delay *= 2
+		if delay >= max {
+			delay = max
+			break
+		}
+	}
+	// Add up to 25% jitter to avoid thundering-herd across streams.
+	// rand.Int63n uses a locked global source (safe for concurrent goroutines, Go ≥ 1.20).
+	if jitterRange := int64(delay / 4); jitterRange > 0 {
+		delay += time.Duration(rand.Int63n(jitterRange))
+	}
+	if delay > max {
+		delay = max
+	}
+	return delay
+}
+
 // PipelineConfig holds dependencies for the ingest pipeline.
 type PipelineConfig struct {
 	JS     jetstream.JetStream
@@ -29,19 +56,20 @@ type PipelineConfig struct {
 
 // Pipeline manages the ingestion of messages from a JetStream stream.
 type Pipeline struct {
-	js            jetstream.JetStream
-	ctrl          *tier.Controller
-	meta          meta.Store
-	streamCfg     config.StreamConfig
-	blockCfg      config.BlockConfig
-	logger        *zap.Logger
-	builder       *block.Builder
-	lingerTimer   *time.Timer
-	pendingAcks   []jetstream.Msg
-	mu            sync.Mutex
-	nextID        atomic.Uint64
-	consumeStream string // stream to create consumer on (may be mirror)
-	isMirror      bool   // true when consuming from an auto-created mirror
+	js                jetstream.JetStream
+	ctrl              *tier.Controller
+	meta              meta.Store
+	streamCfg         config.StreamConfig
+	blockCfg          config.BlockConfig
+	logger            *zap.Logger
+	builder           *block.Builder
+	lingerTimer       *time.Timer
+	pendingAcks       []jetstream.Msg
+	mu                sync.Mutex
+	nextID            atomic.Uint64
+	consumeStream     string // stream to create consumer on (may be mirror)
+	isMirror          bool   // true when consuming from an auto-created mirror
+	consecutiveErrors int    // tracks consecutive fetch failures for backoff
 }
 
 // NewPipeline creates a new ingest pipeline.
@@ -114,6 +142,15 @@ func (p *Pipeline) Run(ctx context.Context) error {
 		batchSize = 256
 	}
 
+	retryInitial := p.streamCfg.Retry.InitialDelay.Duration()
+	if retryInitial == 0 {
+		retryInitial = time.Second
+	}
+	retryMax := p.streamCfg.Retry.MaxDelay.Duration()
+	if retryMax == 0 {
+		retryMax = 60 * time.Second
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -126,8 +163,18 @@ func (p *Pipeline) Run(ctx context.Context) error {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return p.FlushAndClose(context.Background())
 			}
-			p.logger.Warn("fetch error, retrying", zap.Error(err))
-			time.Sleep(time.Second)
+			p.consecutiveErrors++
+			backoff := calcBackoff(p.consecutiveErrors, retryInitial, retryMax)
+			p.logger.Warn("fetch error, retrying",
+				zap.Error(err),
+				zap.Int("consecutive_errors", p.consecutiveErrors),
+				zap.Duration("backoff", backoff),
+			)
+			select {
+			case <-ctx.Done():
+				return p.FlushAndClose(context.Background())
+			case <-time.After(backoff):
+			}
 			continue
 		}
 
@@ -172,8 +219,22 @@ func (p *Pipeline) Run(ctx context.Context) error {
 			p.mu.Unlock()
 		}
 
-		if err := msgs.Error(); err != nil && !errors.Is(err, jetstream.ErrNoMessages) {
-			p.logger.Warn("batch error", zap.Error(err))
+		if batchErr := msgs.Error(); batchErr != nil && !errors.Is(batchErr, jetstream.ErrNoMessages) {
+			p.consecutiveErrors++
+			backoff := calcBackoff(p.consecutiveErrors, retryInitial, retryMax)
+			p.logger.Warn("batch error",
+				zap.Error(batchErr),
+				zap.Int("consecutive_errors", p.consecutiveErrors),
+				zap.Duration("backoff", backoff),
+			)
+			select {
+			case <-ctx.Done():
+				return p.FlushAndClose(context.Background())
+			case <-time.After(backoff):
+			}
+		} else {
+			// Successful fetch iteration: reset backoff counter.
+			p.consecutiveErrors = 0
 		}
 	}
 }

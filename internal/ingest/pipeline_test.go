@@ -30,8 +30,7 @@ func TestCalcBackoff_Doubling(t *testing.T) {
 	initial := time.Second
 	max := 60 * time.Second
 
-	// Without jitter, delay should be initial * 2^(n-1), capped at max.
-	// With up to 25% jitter added, the upper bound is delay*1.25.
+	// Jitter subtracts up to 25%, so delay is in [base*0.75, base].
 	cases := []struct {
 		n    int
 		base time.Duration // expected base before jitter
@@ -48,15 +47,12 @@ func TestCalcBackoff_Doubling(t *testing.T) {
 
 	for _, tc := range cases {
 		d := calcBackoff(tc.n, initial, max)
-		if d < tc.base {
-			t.Errorf("calcBackoff(%d): got %v < base %v", tc.n, d, tc.base)
+		lower := tc.base - tc.base/4
+		if d < lower {
+			t.Errorf("calcBackoff(%d): got %v < lower bound %v", tc.n, d, lower)
 		}
-		upper := tc.base + tc.base/4
-		if upper > max {
-			upper = max
-		}
-		if d > upper {
-			t.Errorf("calcBackoff(%d): got %v > upper bound %v", tc.n, d, upper)
+		if d > tc.base {
+			t.Errorf("calcBackoff(%d): got %v > base %v", tc.n, d, tc.base)
 		}
 	}
 }
@@ -68,5 +64,25 @@ func TestCalcBackoff_NeverExceedsMax(t *testing.T) {
 		if d > max {
 			t.Errorf("calcBackoff(%d) = %v exceeds max %v", n, d, max)
 		}
+	}
+}
+
+func TestCalcBackoff_JitterAtMaxCap(t *testing.T) {
+	// When capped at max, jitter should still produce variation (not always max).
+	max := 60 * time.Second
+	seen := make(map[time.Duration]bool)
+	for i := 0; i < 100; i++ {
+		d := calcBackoff(10, time.Second, max)
+		seen[d] = true
+		if d > max {
+			t.Fatalf("calcBackoff(10) = %v exceeds max %v", d, max)
+		}
+		lower := max - max/4 // 45s
+		if d < lower {
+			t.Fatalf("calcBackoff(10) = %v below lower bound %v", d, lower)
+		}
+	}
+	if len(seen) < 2 {
+		t.Errorf("expected jitter variation at max cap, got %d unique values", len(seen))
 	}
 }

@@ -17,6 +17,8 @@ streams:
   # Regular JetStream stream (auto-detected from name)
   - name: "ORDERS"
     # type: "stream"   # auto-detected (no KV_/OBJ_ prefix)
+    # auto_create_if_missing: true  # (default: true) Auto-create missing stream
+                                     # resources at startup (KV/OBJ/raw stream).
     # subjects: ["orders.>"]
     consumer_name: "nts-archiver"
     # auto_mirror: true  # (default: true) Automatically create a Limits-retention

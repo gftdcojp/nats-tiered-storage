@@ -19,13 +19,13 @@ type Config struct {
 }
 
 type NATSConfig struct {
-	URL            string    `yaml:"url"`
-	CredentialsFile string   `yaml:"credentials_file"`
-	NKeySeedFile   string    `yaml:"nkey_seed_file"`
-	TLS            TLSConfig `yaml:"tls"`
-	ConnectionName string    `yaml:"connection_name"`
-	MaxReconnects  int       `yaml:"max_reconnects"`
-	ReconnectWait  Duration  `yaml:"reconnect_wait"`
+	URL             string    `yaml:"url"`
+	CredentialsFile string    `yaml:"credentials_file"`
+	NKeySeedFile    string    `yaml:"nkey_seed_file"`
+	TLS             TLSConfig `yaml:"tls"`
+	ConnectionName  string    `yaml:"connection_name"`
+	MaxReconnects   int       `yaml:"max_reconnects"`
+	ReconnectWait   Duration  `yaml:"reconnect_wait"`
 }
 
 type TLSConfig struct {
@@ -54,17 +54,18 @@ type FetchRetryConfig struct {
 }
 
 type StreamConfig struct {
-	Name         string           `yaml:"name"`
-	Type         StreamType       `yaml:"type"`
-	Subjects     []string         `yaml:"subjects"`
-	ConsumerName string           `yaml:"consumer_name"`
-	AutoMirror   *bool            `yaml:"auto_mirror"`
-	FetchBatch   int              `yaml:"fetch_batch"`
-	FetchTimeout Duration         `yaml:"fetch_timeout"`
-	Retry        FetchRetryConfig `yaml:"retry"`
-	Tiers        TiersConfig      `yaml:"tiers"`
-	KV           KVArchiveConfig  `yaml:"kv"`
-	ObjectStore  ObjArchiveConfig `yaml:"objectstore"`
+	Name                string           `yaml:"name"`
+	Type                StreamType       `yaml:"type"`
+	AutoCreateIfMissing *bool            `yaml:"auto_create_if_missing"`
+	Subjects            []string         `yaml:"subjects"`
+	ConsumerName        string           `yaml:"consumer_name"`
+	AutoMirror          *bool            `yaml:"auto_mirror"`
+	FetchBatch          int              `yaml:"fetch_batch"`
+	FetchTimeout        Duration         `yaml:"fetch_timeout"`
+	Retry               FetchRetryConfig `yaml:"retry"`
+	Tiers               TiersConfig      `yaml:"tiers"`
+	KV                  KVArchiveConfig  `yaml:"kv"`
+	ObjectStore         ObjArchiveConfig `yaml:"objectstore"`
 }
 
 // AutoMirrorEnabled returns whether auto-mirroring is enabled for this stream.
@@ -74,6 +75,15 @@ func (sc *StreamConfig) AutoMirrorEnabled() bool {
 		return true
 	}
 	return *sc.AutoMirror
+}
+
+// AutoCreateIfMissingEnabled returns whether a missing configured stream should
+// be created automatically at startup. Defaults to true when not explicitly set.
+func (sc *StreamConfig) AutoCreateIfMissingEnabled() bool {
+	if sc.AutoCreateIfMissing == nil {
+		return true
+	}
+	return *sc.AutoCreateIfMissing
 }
 
 type KVArchiveConfig struct {
@@ -167,17 +177,17 @@ type FileTierConfig struct {
 }
 
 type BlobTierConfig struct {
-	Enabled        bool     `yaml:"enabled"`
-	Endpoint       string   `yaml:"endpoint"`
-	Region         string   `yaml:"region"`
-	Bucket         string   `yaml:"bucket"`
-	Prefix         string   `yaml:"prefix"`
-	AccessKeyID    string   `yaml:"access_key_id"`
-	SecretAccessKey string  `yaml:"secret_access_key"`
-	ForcePathStyle bool     `yaml:"force_path_style"`
-	StorageClass   string   `yaml:"storage_class"`
-	MaxAge         Duration `yaml:"max_age"`
-	Multipart      bool     `yaml:"multipart"`
+	Enabled         bool     `yaml:"enabled"`
+	Endpoint        string   `yaml:"endpoint"`
+	Region          string   `yaml:"region"`
+	Bucket          string   `yaml:"bucket"`
+	Prefix          string   `yaml:"prefix"`
+	AccessKeyID     string   `yaml:"access_key_id"`
+	SecretAccessKey string   `yaml:"secret_access_key"`
+	ForcePathStyle  bool     `yaml:"force_path_style"`
+	StorageClass    string   `yaml:"storage_class"`
+	MaxAge          Duration `yaml:"max_age"`
+	Multipart       bool     `yaml:"multipart"`
 }
 
 type BlockConfig struct {
@@ -196,8 +206,8 @@ type MetadataConfig struct {
 }
 
 type APIConfig struct {
-	Enabled       bool              `yaml:"enabled"`
-	Listen        string            `yaml:"listen"`
+	Enabled       bool                `yaml:"enabled"`
+	Listen        string              `yaml:"listen"`
 	NATSResponder NATSResponderConfig `yaml:"nats_responder"`
 }
 

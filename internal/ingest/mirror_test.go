@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -337,5 +338,49 @@ func TestResolveConsumerStream_MirrorAlreadyExists(t *testing.T) {
 	}
 	if !res.IsMirror {
 		t.Error("IsMirror should be true for reused mirror")
+	}
+}
+
+func TestResolveConsumerStream_AutoCreateMissingKV(t *testing.T) {
+	_, natsURL := startEmbeddedNATS(t)
+	js, cleanup := connectJS(t, natsURL)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	cfg := config.StreamConfig{
+		Name:         "KV_auto-created",
+		ConsumerName: "nts-archiver",
+	}
+	res, err := resolveConsumerStream(ctx, js, cfg, zap.NewNop())
+	if err != nil {
+		t.Fatalf("resolveConsumerStream: %v", err)
+	}
+	if res.ConsumeStream != "KV_auto-created" {
+		t.Fatalf("ConsumeStream = %q, want KV_auto-created", res.ConsumeStream)
+	}
+	if _, err := js.Stream(ctx, "KV_auto-created"); err != nil {
+		t.Fatalf("expected KV stream to be auto-created: %v", err)
+	}
+}
+
+func TestResolveConsumerStream_AutoCreateMissingRawStreamRequiresSubjects(t *testing.T) {
+	_, natsURL := startEmbeddedNATS(t)
+	js, cleanup := connectJS(t, natsURL)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	cfg := config.StreamConfig{
+		Name:         "RAW_EVENTS",
+		Type:         config.StreamTypeRaw,
+		ConsumerName: "nts-archiver",
+	}
+	_, err := resolveConsumerStream(ctx, js, cfg, zap.NewNop())
+	if err == nil {
+		t.Fatal("expected error when auto-creating raw stream without subjects")
+	}
+	if got := err.Error(); got == "" || !strings.Contains(got, "requires subjects") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

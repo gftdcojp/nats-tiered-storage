@@ -2,7 +2,9 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gftdcojp/nats-tiered-storage/internal/config"
@@ -43,6 +45,10 @@ func resolveConsumerStream(
 	logger *zap.Logger,
 ) (resolveResult, error) {
 	original := streamCfg.Name
+
+	if err := ensureConfiguredStreamExists(ctx, js, streamCfg, logger); err != nil {
+		return resolveResult{}, err
+	}
 
 	// If auto_mirror is disabled, always use the original stream.
 	if !streamCfg.AutoMirrorEnabled() {
@@ -109,4 +115,84 @@ func resolveConsumerStream(
 	)
 
 	return resolveResult{ConsumeStream: mirrorName, IsMirror: true}, nil
+}
+
+// ensureConfiguredStreamExists verifies the configured stream target exists and,
+// when enabled, auto-creates missing stream/KV/ObjectStore resources.
+//
+// CRITICAL: this prevents startup crash loops when config references a stream
+// that has not been provisioned yet.
+func ensureConfiguredStreamExists(
+	ctx context.Context,
+	js jetstream.JetStream,
+	streamCfg config.StreamConfig,
+	logger *zap.Logger,
+) error {
+	_, err := js.Stream(ctx, streamCfg.Name)
+	if err == nil {
+		return nil
+	}
+	if !isStreamNotFoundErr(err) {
+		return fmt.Errorf("fetching stream %s: %w", streamCfg.Name, err)
+	}
+	if !streamCfg.AutoCreateIfMissingEnabled() {
+		return fmt.Errorf("fetching stream %s: %w", streamCfg.Name, err)
+	}
+
+	switch streamCfg.ResolvedType() {
+	case config.StreamTypeKV:
+		bucket := streamCfg.ResolvedKVBucket()
+		_, createErr := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
+			Bucket: bucket,
+		})
+		if createErr != nil {
+			return fmt.Errorf("auto-creating KV bucket %s for stream %s: %w", bucket, streamCfg.Name, createErr)
+		}
+		logger.Warn("auto-created missing KV stream for configured target",
+			zap.String("stream", streamCfg.Name),
+			zap.String("bucket", bucket),
+		)
+		return nil
+
+	case config.StreamTypeObjectStore:
+		bucket := streamCfg.ResolvedObjBucket()
+		_, createErr := js.CreateOrUpdateObjectStore(ctx, jetstream.ObjectStoreConfig{
+			Bucket: bucket,
+		})
+		if createErr != nil {
+			return fmt.Errorf("auto-creating object store bucket %s for stream %s: %w", bucket, streamCfg.Name, createErr)
+		}
+		logger.Warn("auto-created missing object store stream for configured target",
+			zap.String("stream", streamCfg.Name),
+			zap.String("bucket", bucket),
+		)
+		return nil
+
+	default:
+		if len(streamCfg.Subjects) == 0 {
+			return fmt.Errorf("auto-creating stream %s requires subjects for stream type %s", streamCfg.Name, streamCfg.ResolvedType())
+		}
+		_, createErr := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+			Name:     streamCfg.Name,
+			Subjects: streamCfg.Subjects,
+		})
+		if createErr != nil {
+			return fmt.Errorf("auto-creating stream %s: %w", streamCfg.Name, createErr)
+		}
+		logger.Warn("auto-created missing stream for configured target",
+			zap.String("stream", streamCfg.Name),
+			zap.Strings("subjects", streamCfg.Subjects),
+		)
+		return nil
+	}
+}
+
+func isStreamNotFoundErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, jetstream.ErrStreamNotFound) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "stream not found")
 }

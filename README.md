@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/gftdcojp/nats-tiered-storage/pkg/nts.svg)](https://pkg.go.dev/github.com/gftdcojp/nats-tiered-storage/pkg/nts)
 [![Go Report Card](https://goreportcard.com/badge/github.com/gftdcojp/nats-tiered-storage)](https://goreportcard.com/report/github.com/gftdcojp/nats-tiered-storage)
-[![GHCR](https://img.shields.io/badge/GHCR-v0.3.0-blue)](https://github.com/gftdcojp/nats-tiered-storage/pkgs/container/nats-tiered-storage)
+[![GHCR](https://img.shields.io/badge/GHCR-v0.4.0-blue)](https://github.com/gftdcojp/nats-tiered-storage/pkgs/container/nats-tiered-storage)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 Tiered storage sidecar for [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream).
@@ -60,9 +60,9 @@ make build
 Multi-arch images (linux/amd64, linux/arm64) are published to GHCR:
 
 ```bash
-docker pull ghcr.io/gftdcojp/nats-tiered-storage:0.3.0
+docker pull ghcr.io/gftdcojp/nats-tiered-storage:0.4.0
 docker run -v /path/to/config.yaml:/etc/nts/config.yaml \
-  ghcr.io/gftdcojp/nats-tiered-storage:0.3.0
+  ghcr.io/gftdcojp/nats-tiered-storage:0.4.0
 ```
 
 ### Docker (local build)
@@ -116,6 +116,7 @@ Clients ──> nats-server <────>  |  ┌──────────
 | Health checks | Liveness (`/healthz`) and readiness (`/readyz`) endpoints |
 | Management CLI | `nts-ctl` for inspecting streams, blocks, KV keys, and objects |
 | WorkQueue auto-mirror | Automatically creates a Limits-retention mirror for WorkQueue streams with existing consumers |
+| Missing-stream bootstrap | Auto-creates missing configured stream targets at startup (`auto_create_if_missing`) |
 | Multi-stream | Configure independent policies per JetStream stream |
 | Graceful shutdown | Flushes partial blocks on SIGINT/SIGTERM |
 
@@ -123,7 +124,7 @@ Clients ──> nats-server <────>  |  ┌──────────
 
 ### Prerequisites
 
-- Go 1.22+
+- Go 1.25.7+
 - Docker & Docker Compose (for development stack)
 
 ### Run with Docker Compose
@@ -291,6 +292,7 @@ Stream types are auto-detected from the name prefix (`KV_` → kv, `OBJ_` → ob
 | Setting | Default | Description |
 |---|---|---|
 | `streams[].auto_mirror` | `true` | Auto-create Limits mirror for WorkQueue streams with existing consumers |
+| `streams[].auto_create_if_missing` | `true` | Auto-create missing configured targets (`KV_`, `OBJ_`, and raw stream with subjects) |
 | `block.target_size` | `8MB` | Target block size before sealing |
 | `block.max_linger` | `30s` | Max time to wait before sealing a partial block |
 | `block.compression` | `s2` | Compression algorithm (`none`, `s2`) |
@@ -355,7 +357,7 @@ bin/nats-tiered-storage -config /path/to/config.yaml
 # Docker (GHCR)
 docker run -v /path/to/config.yaml:/etc/nts/config.yaml \
            -v /var/lib/nts:/var/lib/nts \
-           ghcr.io/gftdcojp/nats-tiered-storage:0.3.0
+           ghcr.io/gftdcojp/nats-tiered-storage:0.4.0
 
 # Kubernetes
 kubectl apply -f deploy/kubernetes/configmap.yaml
@@ -396,6 +398,7 @@ streams:
   - name: "TASKS"
     consumer_name: "nts-archiver"
     auto_mirror: false   # disable auto-mirror for this stream
+    auto_create_if_missing: true  # default true; set false to fail fast on missing stream
 ```
 
 ### Typical use case
